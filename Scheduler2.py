@@ -1,11 +1,3 @@
-"""
-Scheduler2.py
-
-Deterministic two-phase CP-SAT scheduler with full reproducibility:
-1) Minimize fallback assignments (maximize non-fallbacks)
-2) Maximize total preference score (1st > 2nd > ...)
-enforces group-pairing and mentor coverage.
-"""
 import pandas as pd
 from ortools.sat.python import cp_model
 
@@ -259,3 +251,4 @@ def build_schedule(df: pd.DataFrame):
     unassigned_df = pd.DataFrame({'Name': unassigned})
     breakdown_df = compute_breakdown(sched, prefs_map)
     return sched_df, unassigned_df, breakdown_df
+
