@@ -5,8 +5,8 @@ import Scheduler2  # scheduling core module
 from Scheduler2 import build_schedule, MAX_PER_SHIFT, load_preferences
 
 # ── Page configuration ──────────────────────────────────────────────────────
-st.set_page_config(page_title="PEMRAP Volunteer Scheduler", layout="wide")
-st.title("📅 PEMRAP Volunteer Scheduler")
+st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3", layout="wide")
+st.title("📅 PEMRAP Volunteer Scheduler V3")
 
 # ── Initialize session state ─────────────────────────────────────────────────
 if "df_raw" not in st.session_state:
@@ -250,3 +250,4 @@ if st.session_state.sched_df is not None:
     )
 
 # Note: Refresh (F5) to reset
+
