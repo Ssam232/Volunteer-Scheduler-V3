@@ -21,6 +21,17 @@ for key, default in (
         st.session_state[key] = default
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+DAY_ORDER = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+DAY_MAP = {
+    "mon":"Monday","monday":"Monday",
+    "tue":"Tuesday","tues":"Tuesday","tuesday":"Tuesday",
+    "wed":"Wednesday","weds":"Wednesday","wednesday":"Wednesday",
+    "thu":"Thursday","thur":"Thursday","thurs":"Thursday","thursday":"Thursday",
+    "fri":"Friday","friday":"Friday",
+    "sat":"Saturday","saturday":"Saturday",
+    "sun":"Sunday","sunday":"Sunday",
+}
+
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
@@ -68,7 +79,6 @@ def build_placement_maps(sched_df: pd.DataFrame):
     if "Day" not in tmp.columns or "Shift" not in tmp.columns:
         ts_tmp = tmp["Time Slot"].astype(str)
         parts_tmp = ts_tmp.str.split(r"\s+", n=1, expand=True)
-        # parts_tmp always has 2 cols with n=1; second may be NaN
         tmp["Day"] = parts_tmp[0].fillna("").astype(str).str.strip().str.title()
         tmp["Shift"] = parts_tmp[1].fillna("").astype(str).str.replace(r"[–—−]", "-", regex=True).str.strip()
     tmp["_key"] = tmp["Name"].map(norm_name)
@@ -103,12 +113,9 @@ def parse_time_to_minutes(s: str) -> int | float:
     s = (s or "").strip().lower()
     s = re.sub(r"[–—−]", "-", s)
     s = re.sub(r"\s+", "", s)
-    # Extract start part before dash
     start = s.split("-", 1)[0]
-    # 12-hr with am/pm
     m = re.match(r"^(\d{1,2}):?(\d{2})(am|pm)?$", start)
     if not m:
-        # try plain hour "9am"
         m = re.match(r"^(\d{1,2})(am|pm)$", start)
         if m:
             h = int(m.group(1)) % 12
@@ -138,7 +145,6 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
     if not shared:
         return "They don't share any common availability in the survey."
 
-    # Current slot -> list of (name, role, fallback)
     by_slot: dict[str, list[tuple[str, str, bool]]] = {}
     for _, r in sched_df.iterrows():
         slot = str(r.get("Time Slot", ""))
@@ -148,7 +154,6 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
     capacity_block, mentor_block = True, True
     for s in shared:
         entries = by_slot.get(s, [])
-        # capacity if placing both (don’t double count if already there)
         already = sum(1 for n, _, _ in entries if n in (a_can, b_can))
         needed = max(0, 2 - already)
         if len(entries) + needed > CAP:
@@ -163,12 +168,12 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
             continue
         mentor_block = False
 
-        return (f"Could only group them by placing both on **{s}** without breaking rules, "
-                f"but that would worsen the objective (more forced assignments / fewer first choices).")
+        return (f"They could share **{s}**, but grouping them there worsens the objective "
+                f"(more forced assignments / fewer top choices).")
 
     if capacity_block and mentor_block:
         return ("All shared slots were at capacity and would also violate mentor coverage "
-                "(adding a mentee without a mentor).")
+                "(a mentee would be without a mentor).")
     if capacity_block:
         return "All shared slots were full."
     if mentor_block:
@@ -188,31 +193,36 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
             raw_pairs_run.append((a_raw, b_raw))
             a_can = vol_lookup.get(norm_name(a_raw))
             b_can = vol_lookup.get(norm_name(b_raw))
-            if a_can and b_can:
-                if a_can != b_can:
-                    valid_pairs_run.append((a_can, b_can))  # skip self-pairs
+            if a_can and b_can and a_can != b_can:
+                valid_pairs_run.append((a_can, b_can))
 
     # Apply and solve safely
-    Scheduler2.GROUP_PAIRS = list(dict.fromkeys(valid_pairs_run))  # dedupe pairs, keep order
+    Scheduler2.GROUP_PAIRS = list(dict.fromkeys(valid_pairs_run))  # dedupe, keep order
     try:
         sched_df, _, breakdown_df = build_schedule(df_raw)
     except Exception as e:
         st.error(f"Scheduling failed: {e}")
         return
 
-    # Parse Day/Shift
+    # Parse Day/Shift from normalized Time Slot ('Day HH:MM-HH:MM')
     if "Time Slot" in sched_df.columns:
         ts = sched_df["Time Slot"].astype(str)
         parts = ts.str.split(r"\s+", n=1, expand=True)
-        sched_df["Day"] = parts[0].fillna("").astype(str).str.strip().str.title()
+        day_raw = parts[0].str.strip().str.lower()
+        sched_df["Day"] = day_raw.map(DAY_MAP).fillna(parts[0].str.strip().str.title())
         sched_df["Shift"] = parts[1].fillna("").astype(str).str.replace(r"[–—−]", "-", regex=True).str.strip()
     else:
         sched_df["Day"], sched_df["Shift"] = "", ""
 
+    # Enforce Mon→Sun (ordered categorical) + chronological sorting
+    sched_df["Day"] = pd.Categorical(sched_df["Day"], categories=DAY_ORDER, ordered=True)
+    sched_df["__k"] = sched_df["Shift"].map(parse_time_to_minutes)
+    sched_df = sched_df.sort_values(["Day", "__k", "Shift", "Name"]).drop(columns="__k")
+
     st.session_state.sched_df = sched_df
     st.session_state.breakdown_df = breakdown_df
 
-    # Build group report (with forced indication + what-if)
+    # Group report
     placed_by_key, forced_by_key = build_placement_maps(sched_df)
     report_rows = []
     for a_raw, b_raw in raw_pairs_run:
@@ -313,103 +323,104 @@ if not uploader:
     st.session_state.group_report = None
     st.session_state.pairs_text = ""
     st.session_state.trigger_run = False
+    st.info("Upload a survey Excel file to start.")
+    st.stop()
 
-if uploader:
-    # Cache raw DataFrame
-    if st.session_state.df_raw is None:
-        try:
-            st.session_state.df_raw = pd.read_excel(uploader)
-        except Exception as e:
-            st.error(f"Failed to read Excel: {e}")
-            st.stop()
-    df_raw = st.session_state.df_raw
+# Cache raw DataFrame
+if st.session_state.df_raw is None:
+    try:
+        st.session_state.df_raw = pd.read_excel(uploader)
+    except Exception as e:
+        st.error(f"Failed to read Excel: {e}")
+        st.stop()
+df_raw = st.session_state.df_raw
 
-    # Data hygiene checks
-    validate_names(df_raw)
-    validate_preference_strings(df_raw)
+# Data hygiene checks
+validate_names(df_raw)
+validate_preference_strings(df_raw)
 
-    # Build volunteer list for grouping UI
-    ui_names = extract_names_for_ui(df_raw)
-    vol_lookup = {norm_name(n): n for n in ui_names}
+# Build volunteer list for grouping UI
+ui_names = extract_names_for_ui(df_raw)
+vol_lookup = {norm_name(n): n for n in ui_names}
 
-    # ── Group-Together Exceptions UI (with clickable typo fixes) ─────────────
-    st.subheader("Group-Together Exceptions")
-    st.write("Enter each pair on its own line: First Last, First Last")
-    st.write("_Leave blank and run if no exceptions._")
+# ── Group-Together Exceptions UI (with clickable typo fixes) ─────────────
+st.subheader("Group-Together Exceptions")
+st.write("Enter each pair on its own line: First Last, First Last")
+st.write("_Leave blank and run if no exceptions._")
 
-    pairs_input = st.text_area(
-        "Pairs (one per line)",
-        key="pairs_text",
-        placeholder="Alice Smith, Bob Jones",
-        height=100,
-    ).strip()
+pairs_input = st.text_area(
+    "Pairs (one per line)",
+    key="pairs_text",
+    placeholder="Alice Smith, Bob Jones",
+    height=100,
+).strip()
 
-    # Build suggestions (clickable)
-    suggestions: list[tuple[str, str | None]] = []  # (raw_name, suggested or None)
-    if pairs_input:
-        for line in pairs_input.splitlines():
-            parts = [p.strip() for p in line.split(",") if p.strip()]
-            if len(parts) != 2:
-                continue
-            a_raw, b_raw = parts
+# Build suggestions (clickable)
+suggestions: list[tuple[str, str | None]] = []  # (raw_name, suggested or None)
+if pairs_input:
+    for line in pairs_input.splitlines():
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        if len(parts) != 2:
+            continue
+        a_raw, b_raw = parts
 
-            def canon_or_suggest(raw: str) -> tuple[str | None, str | None]:
-                canon = vol_lookup.get(norm_name(raw))
-                if canon:
-                    return canon, None
-                keys = list(vol_lookup.keys())
-                match = difflib.get_close_matches(norm_name(raw), keys, n=1, cutoff=0.6)
-                return None, (vol_lookup[match[0]] if match else None)
+        def canon_or_suggest(raw: str) -> tuple[str | None, str | None]:
+            canon = vol_lookup.get(norm_name(raw))
+            if canon:
+                return canon, None
+            keys = list(vol_lookup.keys())
+            match = difflib.get_close_matches(norm_name(raw), keys, n=1, cutoff=0.6)
+            return None, (vol_lookup[match[0]] if match else None)
 
-            a_can, a_sugg = canon_or_suggest(a_raw)
-            b_can, b_sugg = canon_or_suggest(b_raw)
-            if not a_can: suggestions.append((a_raw, a_sugg))
-            if not b_can: suggestions.append((b_raw, b_sugg))
+        a_can, a_sugg = canon_or_suggest(a_raw)
+        b_can, b_sugg = canon_or_suggest(b_raw)
+        if not a_can: suggestions.append((a_raw, a_sugg))
+        if not b_can: suggestions.append((b_raw, b_sugg))
 
-    def _apply_and_rerun(replacements: list[tuple[str, str]]):
-        # de-duplicate replacements for safety
-        uniq = []
-        seen = set()
-        for raw, sugg in replacements:
-            key = (raw, sugg)
-            if key not in seen and sugg:
-                uniq.append((raw, sugg))
-                seen.add(key)
-        text = st.session_state.get("pairs_text", "") or ""
-        st.session_state["pairs_text"] = _replace_tokens(text, uniq)
-        st.session_state["trigger_run"] = True
-        st.rerun()
+def _apply_and_rerun(replacements: list[tuple[str, str]]):
+    # de-duplicate replacements for safety
+    uniq = []
+    seen = set()
+    for raw, sugg in replacements:
+        key = (raw, sugg)
+        if key not in seen and sugg:
+            uniq.append((raw, sugg))
+            seen.add(key)
+    text = st.session_state.get("pairs_text", "") or ""
+    st.session_state["pairs_text"] = _replace_tokens(text, uniq)
+    st.session_state["trigger_run"] = True
+    st.rerun()
 
-    if suggestions:
-        st.markdown("**Name fixes:** click to apply")
-        cols = st.columns(2)
-        fixable = [(raw, sugg) for (raw, sugg) in suggestions if sugg]
-        for i, (raw, sugg) in enumerate(suggestions):
-            if sugg:
-                cols[i % 2].button(
-                    f'Replace "{raw}" → "{sugg}"',
-                    key=f"fix_{i}",
-                    on_click=_apply_and_rerun,
-                    args=([(raw, sugg)],),
-                )
-            else:
-                cols[i % 2].markdown(f"⚠️ **{raw}** — no close match found")
-        if fixable:
-            st.button(
-                "Apply all fixes",
-                key="apply_all_fixes",
+if suggestions:
+    st.markdown("**Name fixes:** click to apply")
+    cols = st.columns(2)
+    fixable = [(raw, sugg) for (raw, sugg) in suggestions if sugg]
+    for i, (raw, sugg) in enumerate(suggestions):
+        if sugg:
+            cols[i % 2].button(
+                f'Replace "{raw}" → "{sugg}"',
+                key=f"fix_{i}",
                 on_click=_apply_and_rerun,
-                args=(fixable,),
+                args=([(raw, sugg)],),
             )
+        else:
+            cols[i % 2].markdown(f"⚠️ **{raw}** — no close match found")
+    if fixable:
+        st.button(
+            "Apply all fixes",
+            key="apply_all_fixes",
+            on_click=_apply_and_rerun,
+            args=(fixable,),
+        )
 
-    # Manual run button
-    if st.button("Run Scheduler"):
-        run_scheduler(df_raw, vol_lookup)
+# Manual run button
+if st.button("Run Scheduler"):
+    run_scheduler(df_raw, vol_lookup)
 
-    # Auto-run if a fix was applied
-    if st.session_state.trigger_run:
-        st.session_state.trigger_run = False
-        run_scheduler(df_raw, vol_lookup)
+# Auto-run if a fix was applied
+if st.session_state.trigger_run:
+    st.session_state.trigger_run = False
+    run_scheduler(df_raw, vol_lookup)
 
 # ── Display Results ──────────────────────────────────────────────────────────
 if st.session_state.sched_df is not None:
@@ -418,18 +429,15 @@ if st.session_state.sched_df is not None:
     has_forced = bool(sched_df.get("Fallback", pd.Series([], dtype=bool)).any())
     has_mit = sched_df.get("Role", pd.Series([], dtype=str)).astype(str).str.lower().eq("mit").any()
 
-    # Order days Mon→Sun
-    desired_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    # Guard if Day missing values
-    if "Day" not in sched_df.columns:
-        sched_df["Day"] = ""
-    days = [d for d in desired_days if d in set(sched_df["Day"].dropna().astype(str))]
-
-    # Sort shifts robustly
-    if "Shift" not in sched_df.columns:
-        sched_df["Shift"] = ""
-    raw_shifts = [str(s).strip() for s in sched_df["Shift"].dropna().unique()]
-    shifts = sorted(raw_shifts, key=parse_time_to_minutes)
+    # Ordered axes for grid/export (use same order everywhere)
+    days = [d for d in DAY_ORDER if (sched_df["Day"] == d).any()]
+    shifts = (
+        sched_df[["Shift"]]
+        .drop_duplicates()
+        .assign(_k=lambda x: x["Shift"].map(parse_time_to_minutes))
+        .sort_values(["_k", "Shift"])["Shift"]
+        .tolist()
+    )
 
     # Build grid safely
     grid = {sh: {d: [] for d in days} for sh in shifts}
@@ -537,10 +545,9 @@ if st.session_state.sched_df is not None:
                 mit_fmt    = wb.add_format({"border": 1, "italic": True})
                 vol_fmt    = wb.add_format({"border": 1})
 
-                # Local day/shift lists
-                days_local = [d for d in desired_days if d in set(sched_df["Day"].dropna().astype(str))]
-                shifts_local = sorted([str(s).strip() for s in sched_df["Shift"].dropna().unique()],
-                                      key=parse_time_to_minutes)
+                # Use the same ordered axes as the preview
+                days_local = days[:]
+                shifts_local = shifts[:]
 
                 # Build grid dict safely for export
                 grid_x = {sh: {d: [] for d in days_local} for sh in shifts_local}
@@ -595,7 +602,6 @@ if st.session_state.sched_df is not None:
         else:
             # Fallback: minimal export without formatting
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                # Provide a simple long-form schedule
                 sched_cols = [c for c in ["Time Slot","Day","Shift","Name","Role","Fallback"] if c in sched_df.columns]
                 sched_df[sched_cols].to_excel(writer, sheet_name="Schedule", index=False)
                 breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
