@@ -44,11 +44,10 @@ DAY_MAP = {
 
 def _norm_slot(s: str) -> str:
     """
-    Conservative normalization for 'Day HH:MM-HH:MM' (or AM/PM variants):
+    Conservative normalization for 'Day HH:MM-HH:MM' (or AM/PM-ish variants):
       - normalize unicode dashes to '-'
       - collapse spaces
       - title-case day via DAY_MAP
-    No aggressive time parsing (keeps your matching behavior stable).
     """
     s = str(s or "").strip()
     if not s:
@@ -79,19 +78,16 @@ def _clean_pairs(volunteers, pairs):
     return out
 
 def _find_col(cols_lower: dict, *candidates: str):
-    """
-    Find a column by a set of candidate keywords (case-insensitive, substring).
-    Returns the real column name or None.
-    """
+    """Find a column by candidate substring(s), case-insensitive. Returns real column or None."""
     for cand in candidates:
         for k, real in cols_lower.items():
             if cand in k:
                 return real
     return None
 
-def _rank_from_header(colname: str) -> int | None:
+def _rank_from_header(colname: str):
     """
-    Try to extract rank (1..5) from a header like:
+    Extract rank (1..5) from header like:
       '1st choice', '2nd availability', 'Pref 3', 'Preference 4', 'Avail 5'
     """
     m = re.search(r"\b(1st|2nd|3rd|4th|5th|[1-5])\b", colname.lower())
@@ -120,39 +116,34 @@ def load_preferences(df: pd.DataFrame):
         raise ValueError("The uploaded sheet is empty.")
 
     df = df.copy()
-    # Build a lowercase->real name map (tolerant of weird headers / spaces)
     cols_lower = {str(c).strip().lower(): c for c in df.columns}
 
-    # ---- Name detection: (First+Last) OR single Name OR fallback first two cols
+    # Names: (First+Last) or single Name, else first two columns
     first_col = _find_col(cols_lower, "first name", "firstname", "first")
     last_col  = _find_col(cols_lower, "last name", "lastname", "last", "surname")
-    name_col  = _find_col(cols_lower, "name")  # catches 'Name' or 'Full Name'
+    name_col  = _find_col(cols_lower, "name")
     if first_col and last_col:
         df["Name"] = df[first_col].fillna("").astype(str).str.strip() + " " + df[last_col].fillna("").astype(str).str.strip()
     elif name_col:
         df["Name"] = df[name_col].fillna("").astype(str).str.strip()
     else:
-        # fallback to first two columns if present
         if df.shape[1] >= 2:
             df["Name"] = df.iloc[:, 0].fillna("").astype(str).str.strip() + " " + df.iloc[:, 1].fillna("").astype(str).str.strip()
         else:
             raise ValueError("Could not find name columns (need 'First/Last name' or 'Name').")
 
-    # ---- Role detection (be lenient): role/position/type/volunteer type
+    # Role: accept role/position/type/volunteer type; if missing, default to volunteer
     role_col = (_find_col(cols_lower, "role") or
                 _find_col(cols_lower, "position") or
                 _find_col(cols_lower, "type") or
                 _find_col(cols_lower, "volunteer type"))
-    # If still None, we’ll default to 'volunteer' for everyone.
 
-    # Volunteers (sorted for determinism)
+    # Volunteers sorted for determinism
     volunteers = sorted([str(x).strip() for x in df["Name"].tolist() if str(x).strip()])
     if not volunteers:
         raise ValueError("No volunteers found after parsing names.")
 
-    # ---- Preference columns: very tolerant
-    # Accept anything that mentions choice/availability/pref/avail/preference
-    # and also headers that contain a clear rank number (1st..5th or 1..5).
+    # Preference columns (tolerant)
     pref_cols = []
     for c in df.columns:
         cl = str(c).lower()
@@ -161,18 +152,16 @@ def load_preferences(df: pd.DataFrame):
     if not pref_cols:
         raise ValueError("No preference/availability columns detected (need headers with 'choice', 'availability', 'pref', or a 1..5 rank).")
 
-    # Stable order of pref columns: by detected rank if present, else keep sheet order
-    ranked = []
-    unranked = []
+    # Keep ranked columns in order; then unranked in sheet order
+    ranked, unranked = [], []
     for c in pref_cols:
         r = _rank_from_header(str(c))
         (ranked if r else unranked).append((r, c))
     ranked.sort(key=lambda t: t[0] or 999)
     ordered_pref_cols = [c for _, c in ranked] + [c for _, c in unranked]
 
-    # ---- Build roles + prefs
-    roles = {}
-    prefs_map = {}
+    # Roles + Preferences
+    roles, prefs_map = {}, {}
     for _, row in df.iterrows():
         name = str(row["Name"]).strip()
         if not name:
@@ -189,13 +178,13 @@ def load_preferences(df: pd.DataFrame):
                     prefs.append(ns)
         prefs_map[name] = prefs
 
-    # ---- Distinct normalized shifts
+    # Distinct normalized shifts
     shifts_set = {slot for prefs in prefs_map.values() for slot in prefs if slot}
     if not shifts_set:
         raise ValueError("No valid shift strings found in preferences.")
     shifts = sorted(shifts_set)
 
-    # ---- Weights
+    # Weights
     weights = {}
     for name, prefs in prefs_map.items():
         for rank, slot in enumerate(prefs, start=1):
@@ -219,6 +208,11 @@ def solve_schedule(volunteers, roles, shifts, weights):
     mentors = [v for v in volunteers if roles.get(v) == "mentor"]
     # MIT is NOT counted as mentor
 
+    # If mentees exist but there are zero mentors at all, strict solve cannot satisfy coverage.
+    # Raise to trigger relaxed solve, where we'll forbid assigning mentees.
+    if mentees and not mentors:
+        raise RuntimeError("No mentors in data: cannot satisfy mentee-coverage rule.")
+
     clean_pairs = _clean_pairs(volunteers, GROUP_PAIRS)
 
     # ----- Phase 1 -----
@@ -239,9 +233,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
             model1.Add(sum(x1[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y1[s])
             model1.Add(sum(x1[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y1[s].Not())
             model1.Add(sum(x1[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y1[s])
-    # If mentees exist but no mentors, we skip coverage (legacy behavior).
 
-    # Objective 1: maximize non-fallback assignments
     model1.Maximize(
         sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x1[(v, s)]
             for v in volunteers for s in shifts)
@@ -274,13 +266,12 @@ def solve_schedule(volunteers, roles, shifts, weights):
             model2.Add(sum(x2[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y2[s].Not())
             model2.Add(sum(x2[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y2[s])
 
-    # Lock Phase 1 optimum for lexicographic priority
+    # Lock Phase 1 optimum
     model2.Add(
         sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x2[(v, s)]
             for v in volunteers for s in shifts) == best_nonfb
     )
 
-    # Objective 2: maximize preference weights
     model2.Maximize(sum(weights[(v, s)] * x2[(v, s)] for v in volunteers for s in shifts))
 
     solver2 = cp_model.CpSolver()
@@ -325,12 +316,18 @@ def solve_relaxed(volunteers, roles, shifts, weights):
 
     mentees = [v for v in volunteers if roles.get(v) == "mentee"]
     mentors = [v for v in volunteers if roles.get(v) == "mentor"]
-    if mentees and mentors:
-        y = {s: model.NewBoolVar(f"y_{s}") for s in shifts}
+
+    if mentees and not mentors:
+        # No mentors at all → forbid assigning mentees anywhere in relaxed solve.
         for s in shifts:
-            model.Add(sum(x[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y[s])
-            model.Add(sum(x[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y[s].Not())
-            model.Add(sum(x[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y[s])
+            model.Add(sum(x[(v, s)] for v in mentees) == 0)
+    else:
+        if mentees and mentors:
+            y = {s: model.NewBoolVar(f"y_{s}") for s in shifts}
+            for s in shifts:
+                model.Add(sum(x[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y[s])
+                model.Add(sum(x[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y[s].Not())
+                model.Add(sum(x[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y[s])
 
     model.Maximize(sum(x[(v, s)] for v in volunteers for s in shifts))
 
