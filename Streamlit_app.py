@@ -19,15 +19,15 @@ def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
     Tries First/Last -> Name -> first two columns. Case/space insensitive.
     """
     cols = {c.lower(): c for c in df.columns}
-    first = next((cols[k] for k in cols if 'first' in k and 'name' in k), None)
-    last  = next((cols[k] for k in cols if 'last'  in k and 'name' in k), None)
+    first = next((cols[k] for k in cols if "first" in k and "name" in k), None)
+    last  = next((cols[k] for k in cols if "last"  in k and "name" in k), None)
     if first and last:
-        names = (df[first].astype(str).str.strip() + ' ' + df[last].astype(str).str.strip()).tolist()
-    elif 'name' in cols:
-        names = df[cols['name']].astype(str).tolist()
+        names = (df[first].astype(str).str.strip() + " " + df[last].astype(str).str.strip()).tolist()
+    elif "name" in cols:
+        names = df[cols["name"]].astype(str).tolist()
     else:
-        names = (df.iloc[:,0].astype(str).str.strip() + ' ' + df.iloc[:,1].astype(str).str.strip()).tolist()
-    names = {re.sub(r'\s+', ' ', n).strip() for n in names if str(n).strip()}
+        names = (df.iloc[:, 0].astype(str).str.strip() + " " + df.iloc[:, 1].astype(str).str.strip()).tolist()
+    names = {re.sub(r"\s+", " ", n).strip() for n in names if str(n).strip()}
     return sorted(names)
 
 def norm_name(s: str) -> str:
@@ -61,6 +61,10 @@ if uploader:
     st.subheader("Group-Together Exceptions")
     st.write("Enter each pair on its own line: First Last, First Last")
     st.write("_Leave blank and run if no exceptions._")
+
+    # Bind the textarea to session state so we can edit it via buttons
+    if "pairs_text" not in st.session_state:
+        st.session_state["pairs_text"] = ""
 
     pairs_input = st.text_area(
         "Pairs (one per line)",
@@ -107,11 +111,10 @@ if uploader:
         rep_map = {raw: sugg for raw, sugg in replacements if sugg}
         new_lines = []
         for line in lines:
-            parts = [p.strip() for p in line.split(',')]
+            parts = [p.strip() for p in line.split(",")]
             new_parts = [rep_map.get(p, p) for p in parts if p]
-            new_lines.append(', '.join(new_parts))
-        return '
-'.join(new_lines)
+            new_lines.append(", ".join(new_parts))
+        return "\n".join(new_lines)  # <-- fixed newline
 
     def _replace_one_cb(raw: str, sugg: str):
         text = st.session_state.get("pairs_text", "") or ""
@@ -131,7 +134,7 @@ if uploader:
         for i, (raw, sugg) in enumerate(suggestions):
             if sugg:
                 cols[i % 2].button(
-                    f"Replace “{raw}” → “{sugg}”",
+                    f'Replace "{raw}" -> "{sugg}"',
                     key=f"fix_{i}",
                     on_click=_replace_one_cb,
                     args=(raw, sugg),
@@ -229,7 +232,10 @@ if uploader:
                 report_rows.append({
                     "Pair": f"{a_can} & {b_can}",
                     "Status": "Not grouped ✗",
-                    "Details": f"Both were scheduled but on different shifts — **{a_can} → {sa}**, **{b_can} → {sb}**. Try freeing space or adjusting their preferences."
+                    "Details": (
+                        f"Both were scheduled but on different shifts — **{a_can} → {sa}**, "
+                        f"**{b_can} → {sb}**. Try freeing space or adjusting their preferences."
+                    )
                 })
                 continue
 
@@ -273,7 +279,7 @@ if st.session_state.sched_df is not None:
         if sh in grid and d in grid[sh]:
             grid[sh][d].append((row["Name"], row.get("Role", ""), bool(row["Fallback"])))
 
-    # Grouping results table (now shown BEFORE the schedule preview)
+    # Grouping results table (shown BEFORE the schedule preview)
     if st.session_state.group_report is not None and not st.session_state.group_report.empty:
         st.subheader("Group-Together Results")
         st.dataframe(st.session_state.group_report, use_container_width=True)
@@ -293,9 +299,9 @@ if st.session_state.sched_df is not None:
                 entries = grid.get(sh, {}).get(d, [])
                 if i < len(entries):
                     name, role, fb = entries[i]
-                    if role == 'mentor':
+                    if role == "mentor":
                         cell = f"<strong>{name}</strong>"
-                    elif role == 'mentee':
+                    elif role == "mentee":
                         cell = (
                             "<span style='background:#add8e6;padding:2px 4px;border-radius:3px'>"
                             f"{name}</span>"
@@ -303,7 +309,7 @@ if st.session_state.sched_df is not None:
                     else:
                         cell = name
                     if fb:
-                        cell += ' *'
+                        cell += " *"
                 html += (
                     f"<td style='border:1px solid #ddd;padding:8px;vertical-align:top;'>{cell}</td>"
                 )
@@ -317,7 +323,6 @@ if st.session_state.sched_df is not None:
     )
     st.markdown(html, unsafe_allow_html=True)
 
-    
     # Preference Breakdown
     st.subheader("Preference Breakdown")
     st.dataframe(breakdown_df, use_container_width=True)
@@ -373,7 +378,7 @@ if st.session_state.sched_df is not None:
                         ppl = grid_x.get(sh, {}).get(day, [])
                         if i < len(ppl):
                             nm, rl, fb_flag = ppl[i]
-                            fmt = mentor_fmt if rl == 'mentor' else mentee_fmt if rl == 'mentee' else vol_fmt
+                            fmt = mentor_fmt if rl == "mentor" else mentee_fmt if rl == "mentee" else vol_fmt
                             ws.write(row_idx + i, c, nm + (" *" if fb_flag else ""), fmt)
                         else:
                             ws.write_blank(row_idx + i, c, None, border)
