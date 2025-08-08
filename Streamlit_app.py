@@ -100,29 +100,39 @@ if uploader:
                     suggestions.append((b_raw, b_sugg))
 
     # Render clickable suggestions (non-blocking) using callbacks
-    def _replace_one(raw: str, sugg: str):
-        text = st.session_state.get("pairs_text", "") or ""
-        pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
-        st.session_state["pairs_text"] = re.sub(pattern, sugg, text)
+    def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
+        # Parse pairs text line-by-line, replace exact tokens between commas
+        lines = (text or "").splitlines()
+        new_lines = []
+        rep_map = {raw: sugg for raw, sugg in replacements if sugg}
+        for line in lines:
+            parts = [p.strip() for p in line.split(',')]
+            new_parts = [rep_map.get(p, p) for p in parts if p]
+            new_lines.append(', '.join(new_parts))
+        return '
+'.join(new_lines)
 
-    def _replace_all(suggs: list[tuple[str, str | None]]):
+    def _replace_one_cb(raw: str, sugg: str):
         text = st.session_state.get("pairs_text", "") or ""
-        for raw, sugg in suggs:
-            if sugg:
-                pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
-                text = re.sub(pattern, sugg, text)
-        st.session_state["pairs_text"] = text
+        st.session_state["pairs_text"] = _replace_tokens(text, [(raw, sugg)])
+        st.rerun()
+
+    def _replace_all_cb(suggs: list[tuple[str, str | None]]):
+        text = st.session_state.get("pairs_text", "") or ""
+        repl = [(raw, sugg) for raw, sugg in suggs if sugg]
+        st.session_state["pairs_text"] = _replace_tokens(text, repl)
+        st.rerun()
 
     if suggestions:
         st.markdown("**Name fixes:** click to apply")
         cols = st.columns(2)
-        any_fixable = any(sugg for _, sugg in suggestions)
+        any_fixable = any(s for _, s in suggestions)
         for i, (raw, sugg) in enumerate(suggestions):
             if sugg:
                 cols[i % 2].button(
                     f"Replace “{raw}” → “{sugg}”",
                     key=f"fix_{i}",
-                    on_click=_replace_one,
+                    on_click=_replace_one_cb,
                     args=(raw, sugg),
                 )
             else:
@@ -131,7 +141,7 @@ if uploader:
             st.button(
                 "Apply all fixes",
                 key="apply_all_fixes",
-                on_click=_replace_all,
+                on_click=_replace_all_cb,
                 args=(suggestions,),
             )
 
@@ -253,6 +263,11 @@ if st.session_state.sched_df is not None:
         d, sh = str(row.get("Day", "")).strip(), str(row.get("Shift", "")).strip()
         if sh in grid and d in grid[sh]:
             grid[sh][d].append((row["Name"], row.get("Role", ""), bool(row["Fallback"])))
+
+    # Grouping results table (now shown BEFORE the schedule preview)
+    if st.session_state.group_report is not None and not st.session_state.group_report.empty:
+        st.subheader("Group-Together Results")
+        st.dataframe(st.session_state.group_report, use_container_width=True)
 
     # ── HTML Grid ──────────────────────────────────────────────────────────────
     html = "<table style='border-collapse: collapse; width:100%;'>"
