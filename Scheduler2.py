@@ -7,9 +7,11 @@ from ortools.sat.python import cp_model
 # Configuration
 # ----------------------------------
 MAX_PER_SHIFT = 3
-LEX_WEIGHTS = {1: 100000, 2: 10000, 3: 1000, 4: 100, 5: 10}  # Phase-2 scoring
+# Phase-2 preference weights (after minimizing fallbacks)
+LEX_WEIGHTS = {1: 100000, 2: 10000, 3: 1000, 4: 100, 5: 10}
 FALLBACK_WEIGHT = 0
-GROUP_PAIRS = []  # set by Streamlit: list of (nameA, nameB)
+# Filled by Streamlit: list of (nameA, nameB) to schedule together
+GROUP_PAIRS = []
 
 # ----------------------------------
 # Helpers
@@ -49,8 +51,8 @@ def _fmt_24h(minutes: int) -> str:
 
 def _parse_time_component(t: str):
     """
-    Parse a single time like '10', '10:30', '2pm', '2:30 PM', '14:00'.
-    Returns (minutes, had_meridian, was_12hr_candidate)
+    Parse a single time: '10', '10:30', '2pm', '2:30 PM', '14:00'.
+    Returns (minutes, had_meridian, could_be_12h)
     """
     raw = str(t)
     s = re.sub(r"\s+", "", raw.lower()).replace(".", "")
@@ -65,7 +67,6 @@ def _parse_time_component(t: str):
         if mer == "pm":
             hh += 12
         return hh * 60 + mm, True, True
-    # No meridian → treat as 24h if valid; also track if it *could* be 12h
     could_be_12h = 1 <= hh <= 12
     if 0 <= hh <= 23 and 0 <= mm <= 59:
         return hh * 60 + mm, False, could_be_12h
@@ -77,9 +78,9 @@ def _parse_time_range_to_24h(range_text: str) -> str | None:
       '10-2pm', '10am-2', '10:00-14:00', '10am - 2:30pm', '10.00AM-2.00 PM'
     → 'HH:MM-HH:MM' (24h).
     Inference rules:
-      • If exactly one side has am/pm, infer the *other* side’s meridian to match.
+      • If exactly one side has am/pm, infer the other side’s meridian to match (when plausible).
       • If both lack am/pm, assume 24h.
-      • No overnight handling (if start >= end we keep it; that’s the data).
+      • No overnight handling (if start >= end we keep as-is).
     """
     txt = str(range_text or "")
     txt = txt.replace("–", "-").replace("—", "-").replace("−", "-")
@@ -96,7 +97,7 @@ def _parse_time_range_to_24h(range_text: str) -> str | None:
     if L != L or R != R:  # NaN
         return None
 
-    # If right has meridian but left doesn't → try to align left to same half-day if it could be 12h
+    # Align meridian if only one side has it and the other could plausibly be 12h
     if R_has and not L_has and L_cand12:
         mer = re.search(r"(am|pm)", right_raw.lower())
         if mer:
@@ -109,7 +110,6 @@ def _parse_time_range_to_24h(range_text: str) -> str | None:
                     hh += 12
                 L = hh * 60 + mm
 
-    # If left has meridian but right doesn't → align right if it could be 12h
     if L_has and not R_has and R_cand12:
         mer = re.search(r"(am|pm)", left_raw.lower())
         if mer:
@@ -124,6 +124,21 @@ def _parse_time_range_to_24h(range_text: str) -> str | None:
 
     return f"{_fmt_24h(int(L))}-{_fmt_24h(int(R))}"
 
+def _map_simple_windows(rest: str) -> str | None:
+    """
+    Map bare survey windows (no am/pm) to canonical 24h blocks.
+    Accepts '10-2', '10:00-2', '10-2:00' (spaces/dashes irrelevant).
+    """
+    s = re.sub(r"\s+", "", str(rest))
+    s = s.replace("–","-").replace("—","-").replace("−","-")
+    s = re.sub(r":?00", "", s)  # strip ':00'
+    m = {
+        "10-2": "10:00-14:00",
+        "2-6":  "14:00-18:00",
+        "6-10": "18:00-22:00",
+    }
+    return m.get(s)
+
 def _norm_slot(s: str) -> str:
     """
     Normalize 'Day time-range' to 'Day HH:MM-HH:MM' (24h).
@@ -131,14 +146,20 @@ def _norm_slot(s: str) -> str:
     s = str(s or "").strip()
     if not s:
         return ""
-    s = re.sub(r"[–—−]", "-", s)          # normalize em/en dashes
+    s = re.sub(r"[–—−]", "-", s)          # normalize dashes
     s = re.sub(r"\s+", " ", s).strip()    # collapse spaces
     parts = s.split(" ", 1)
     if len(parts) < 2:
         return s
-    day_raw, rest = parts[0], parts[1]
+    day_raw, rest = parts[0], parts[1].strip()
     day = DAY_MAP.get(day_raw.lower(), day_raw.title())
-    rest = rest.strip()
+
+    # Special-case common windows from your survey
+    mapped = _map_simple_windows(rest)
+    if mapped:
+        return f"{day} {mapped}"
+
+    # General parser
     rng = _parse_time_range_to_24h(rest)
     if not rng:
         rest = rest.replace(" ", "")
@@ -147,6 +168,7 @@ def _norm_slot(s: str) -> str:
     return f"{day} {rng}"
 
 def _clean_pairs(volunteers, pairs):
+    """Remove self/unknown/duplicate pairs; keep input order."""
     vset = set(volunteers)
     out, seen = [], set()
     for a, b in (pairs or []):
@@ -160,6 +182,7 @@ def _clean_pairs(volunteers, pairs):
     return out
 
 def _find_col(cols_lower: dict, *candidates: str):
+    """Find a column by candidate substring(s), case-insensitive. Returns real column or None."""
     for cand in candidates:
         for k, real in cols_lower.items():
             if cand in k:
@@ -167,6 +190,10 @@ def _find_col(cols_lower: dict, *candidates: str):
     return None
 
 def _rank_from_header(colname: str):
+    """
+    Extract rank (1..5) from header like:
+      '1st choice', '2nd availability', 'Pref 3', 'Preference 4', 'Avail 5'
+    """
     m = re.search(r"\b(1st|2nd|3rd|4th|5th|[1-5])\b", colname.lower())
     if not m:
         return None
@@ -179,13 +206,23 @@ def _rank_from_header(colname: str):
 # Load and parse preferences
 # ----------------------------------
 def load_preferences(df: pd.DataFrame):
+    """
+    Returns:
+      volunteers: list[str]
+      roles: dict[name -> role]
+      shifts: list[str] (normalized to 'Day HH:MM-HH:MM' 24h)
+      weights: dict[(name, shift) -> int]
+      prefs_map: dict[name -> list[str]]
+    Raises:
+      ValueError if required data is missing.
+    """
     if df is None or df.empty:
         raise ValueError("The uploaded sheet is empty.")
 
     df = df.copy()
     cols_lower = {str(c).strip().lower(): c for c in df.columns}
 
-    # Names
+    # Names: (First+Last) or single Name, else first two columns
     first_col = _find_col(cols_lower, "first name", "firstname", "first")
     last_col  = _find_col(cols_lower, "last name", "lastname", "last", "surname")
     name_col  = _find_col(cols_lower, "name")
@@ -199,25 +236,27 @@ def load_preferences(df: pd.DataFrame):
         else:
             raise ValueError("Could not find name columns (need 'First/Last name' or 'Name').")
 
-    # Role (lenient)
+    # Role: accept role/position/type/volunteer type; if missing, default to volunteer
     role_col = (_find_col(cols_lower, "role") or
                 _find_col(cols_lower, "position") or
                 _find_col(cols_lower, "type") or
                 _find_col(cols_lower, "volunteer type"))
 
+    # Volunteers sorted for determinism
     volunteers = sorted([str(x).strip() for x in df["Name"].tolist() if str(x).strip()])
     if not volunteers:
         raise ValueError("No volunteers found after parsing names.")
 
-    # Pref columns
+    # Preference columns (tolerant)
     pref_cols = []
     for c in df.columns:
         cl = str(c).lower()
         if any(k in cl for k in ("choice", "availability", "avail", "pref", "preference")) or _rank_from_header(cl):
             pref_cols.append(c)
     if not pref_cols:
-        raise ValueError("No preference/availability columns detected.")
+        raise ValueError("No preference/availability columns detected (need headers with 'choice', 'availability', 'pref', or a 1..5 rank).")
 
+    # Keep ranked columns in order; then unranked in sheet order
     ranked, unranked = [], []
     for c in pref_cols:
         r = _rank_from_header(str(c))
@@ -225,6 +264,7 @@ def load_preferences(df: pd.DataFrame):
     ranked.sort(key=lambda t: t[0] or 999)
     ordered_pref_cols = [c for _, c in ranked] + [c for _, c in unranked]
 
+    # Roles + Preferences
     roles, prefs_map = {}, {}
     for _, row in df.iterrows():
         name = str(row["Name"]).strip()
@@ -237,16 +277,18 @@ def load_preferences(df: pd.DataFrame):
         for c in ordered_pref_cols:
             val = row.get(c, None)
             if pd.notna(val):
-                ns = _norm_slot(val)  # normalized to Day HH:MM-HH:MM (24h) if possible
+                ns = _norm_slot(val)  # normalize to Day HH:MM-HH:MM (24h) if possible
                 if ns:
                     prefs.append(ns)
         prefs_map[name] = prefs
 
+    # Distinct normalized shifts
     shifts_set = {slot for prefs in prefs_map.values() for slot in prefs if slot}
     if not shifts_set:
         raise ValueError("No valid shift strings found in preferences.")
     shifts = sorted(shifts_set)
 
+    # Weights
     weights = {}
     for name, prefs in prefs_map.items():
         for rank, slot in enumerate(prefs, start=1):
@@ -259,6 +301,8 @@ def load_preferences(df: pd.DataFrame):
 
 # ----------------------------------
 # Two-phase lexicographic solve
+#   Phase 1: maximize # non-fallback assignments
+#   Phase 2: maximize preference weights subject to Phase 1 optimum
 # ----------------------------------
 def solve_schedule(volunteers, roles, shifts, weights):
     volunteers = sorted(volunteers)
@@ -266,10 +310,11 @@ def solve_schedule(volunteers, roles, shifts, weights):
 
     mentees = [v for v in volunteers if roles.get(v) == "mentee"]
     mentors = [v for v in volunteers if roles.get(v) == "mentor"]
+    # MIT is NOT counted as mentor for coverage
 
     clean_pairs = _clean_pairs(volunteers, GROUP_PAIRS)
 
-    # Phase 1
+    # ----- Phase 1 -----
     model1 = cp_model.CpModel()
     x1 = {(v, s): model1.NewBoolVar(f"x1_{v}_{s}") for v in volunteers for s in shifts}
 
@@ -281,6 +326,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
         for s in shifts:
             model1.Add(x1[(a, s)] == x1[(b, s)])
 
+    # Coverage with big-M: if any mentee on s, require a mentor
     if mentees:
         z1 = {s: model1.NewBoolVar(f"z1_mentor_present_{s}") for s in shifts}
         for s in shifts:
@@ -290,6 +336,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
             else:
                 model1.Add(z1[s] == 0)
 
+    # Objective 1: maximize number of non-fallback assignments
     model1.Maximize(
         sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x1[(v, s)]
             for v in volunteers for s in shifts)
@@ -304,7 +351,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
         raise RuntimeError("No feasible schedule.")
     best_nonfb = int(solver1.ObjectiveValue())
 
-    # Phase 2
+    # ----- Phase 2 -----
     model2 = cp_model.CpModel()
     x2 = {(v, s): model2.NewBoolVar(f"x2_{v}_{s}") for v in volunteers for s in shifts}
 
@@ -325,11 +372,13 @@ def solve_schedule(volunteers, roles, shifts, weights):
             else:
                 model2.Add(z2[s] == 0)
 
+    # Lock Phase 1 optimum
     model2.Add(
         sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x2[(v, s)]
             for v in volunteers for s in shifts) == best_nonfb
     )
 
+    # Objective 2: maximize preference score (lexicographic second)
     model2.Maximize(sum(weights[(v, s)] * x2[(v, s)] for v in volunteers for s in shifts))
 
     solver2 = cp_model.CpSolver()
@@ -340,6 +389,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
     if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError("No feasible schedule in phase 2.")
 
+    # Extract schedule (NO extra sort inside each shift)
     schedule = {s: [] for s in shifts}
     assigned = set()
     for (v, s), var in x2.items():
@@ -353,7 +403,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
     return schedule, assigned
 
 # ----------------------------------
-# Relaxed solve
+# Relaxed solve (≤1 per person, keep sensible rules)
 # ----------------------------------
 def solve_relaxed(volunteers, roles, shifts, weights):
     volunteers = sorted(volunteers)
@@ -411,7 +461,7 @@ def prepare_schedule_df(schedule: dict) -> pd.DataFrame:
     for slot, items in schedule.items():
         for a in items:
             rows.append({
-                "Time Slot": slot,  # already 'Day HH:MM-HH:MM' (24h)
+                "Time Slot": slot,            # already normalized to Day HH:MM-HH:MM (24h)
                 "Name": a.get("Name", ""),
                 "Role": a.get("Role", "volunteer"),
                 "Fallback": bool(a.get("Fallback", False)),
@@ -448,7 +498,7 @@ def compute_breakdown(schedule: dict, prefs_map: dict[str, list[str]]) -> pd.Dat
 def build_schedule(df: pd.DataFrame):
     """
     Returns:
-      sched_df:      [Time Slot, Name, Role, Fallback]
+      sched_df:      [Time Slot, Name, Role, Fallback]  (Time Slot is 24h)
       unassigned_df: [Name]
       breakdown_df:  [Preference, Count, Percentage]
     """
