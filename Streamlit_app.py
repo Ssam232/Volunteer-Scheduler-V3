@@ -92,18 +92,17 @@ def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
         new_lines.append(", ".join(new_parts))
     return "\n".join(new_lines)
 
-# ---- WHAT-IF EXPLAINER (Option 3) ------------------------------------------
+# ---- WHAT-IF EXPLAINER (UI Option 3) ---------------------------------------
 def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw: pd.DataFrame) -> str:
     """
     Heuristic post-solve explainer:
     - If no shared availability → say so.
     - Else check each shared slot for capacity/mentor coverage feasibility w.r.t. current schedule.
-    - If some slot looks feasible, say it would worsen objective (more forced assignments / lower prefs).
+    - If some slot looks feasible, say it would worsen objective (more forced assignments / fewer first choices).
     """
     try:
         volunteers, roles, shifts, weights, prefs_map = load_preferences(df_raw)
     except Exception:
-        # If parsing prefs fails, keep it simple
         return "Could not analyze availability details from the survey."
 
     prefs_a = set(prefs_map.get(a_can, []))
@@ -112,7 +111,7 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
     if not shared:
         return "They don't share any common availability in the survey."
 
-    # Build current slot->[(name, role, fb)]
+    # Current slot -> list of (name, role, fallback)
     by_slot: dict[str, list[tuple[str, str, bool]]] = {}
     for _, r in sched_df.iterrows():
         slot = str(r["Time Slot"])
@@ -121,24 +120,23 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
     capacity_block, mentor_block = True, True
     for s in shared:
         entries = by_slot.get(s, [])
-        # capacity needed: 2 minus number already there among the pair
-        already = sum(1 for n,_,_ in entries if n in (a_can, b_can))
+        # capacity check if adding both
+        already = sum(1 for n, _, _ in entries if n in (a_can, b_can))
         needed = 2 - already
         if len(entries) + max(0, needed) > MAX_PER_SHIFT:
-            # capacity block on this slot
-            continue
+            continue  # capacity blocked here
         capacity_block = False
-        # mentor coverage if mentee present
+
+        # mentor coverage if any mentee present
         roles_here = [rl for _, rl, _ in entries]
-        # after adding them:
         roles_aug = roles_here + [roles.get(a_can, ""), roles.get(b_can, "")]
         any_mentee = any(r == "mentee" for r in roles_aug)
         any_mentor = any(r == "mentor" for r in roles_aug)
         if any_mentee and not any_mentor:
-            # mentor rule would be broken here
-            continue
+            continue  # mentor rule blocked here
         mentor_block = False
-        # This slot looks feasible under rules → solver likely avoided it due to objective trade-offs
+
+        # Feasible under rules, solver likely avoided due to objective tradeoffs
         return (f"Could only group them by placing both on **{s}** without breaking rules, "
                 f"but that would worsen the objective (more forced assignments / fewer first choices).")
 
@@ -149,12 +147,10 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
         return "All shared slots were full (3 of 3)."
     if mentor_block:
         return "Shared slots would break mentor coverage (mentee present without a mentor)."
-    # Fallback generic
     return "Grouping would worsen the objective under current constraints."
 
 def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     """Run the solver using current pairs_text and store results in session_state."""
-    # Parse pairs for this run
     pairs_text = (st.session_state.get("pairs_text") or "").strip()
     valid_pairs_run, raw_pairs_run = [], []
     if pairs_text:
@@ -419,16 +415,6 @@ if st.session_state.sched_df is not None:
         styled = style_group_report(st.session_state.group_report)
         st.table(styled)
 
-    # ── Legend (UI polish option 3) ───────────────────────────────────────────
-    legend = """
-    <div style="margin: 12px 0;">
-      <span style="display:inline-block;margin-right:16px;"><strong>Mentor</strong></span>
-      <span style="display:inline-block;margin-right:16px;background:#add8e6;padding:2px 6px;border-radius:4px;">Mentee</span>
-      <span style="display:inline-block;margin-right:16px;">* Forced</span>
-    </div>
-    """
-    st.markdown(legend, unsafe_allow_html=True)
-
     # ── HTML Grid ──────────────────────────────────────────────────────────────
     html = "<table style='border-collapse: collapse; width:100%;'>"
     html += "<tr><th></th>" + "".join(f"<th>{d}</th>" for d in days) + "</tr>"
@@ -467,6 +453,16 @@ if st.session_state.sched_df is not None:
         unsafe_allow_html=True,
     )
     st.markdown(html, unsafe_allow_html=True)
+
+    # Legend BELOW the preview
+    legend = """
+    <div style="margin: 12px 0;">
+      <span style="display:inline-block;margin-right:16px;"><strong>Mentor</strong></span>
+      <span style="display:inline-block;margin-right:16px;background:#add8e6;padding:2px 6px;border-radius:4px;">Mentee</span>
+      <span style="display:inline-block;margin-right:16px;">* Forced</span>
+    </div>
+    """
+    st.markdown(legend, unsafe_allow_html=True)
 
     # Preference Breakdown
     st.subheader("Preference Breakdown")
@@ -531,6 +527,13 @@ if st.session_state.sched_df is not None:
                 row_idx += MAX_PER_SHIFT
             ws.set_column(0, 0, 16)
             ws.set_column(1, len(days_local), 22)
+
+            # Leave a blank row, then a legend under the grid
+            row_idx += 1
+            ws.write(row_idx, 0, "Legend:", border)
+            ws.write(row_idx, 1, "Mentor", mentor_fmt)
+            ws.write(row_idx, 2, "Mentee", mentee_fmt)
+            ws.write(row_idx, 3, "* Forced", border)
 
             # Preferences & Fallback sheets
             breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
