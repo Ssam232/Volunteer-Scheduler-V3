@@ -99,31 +99,45 @@ if uploader:
                 if not b_can:
                     suggestions.append((b_raw, b_sugg))
 
-    # Render clickable suggestions (non-blocking)
+    # Render clickable suggestions (non-blocking) using callbacks
+    def _replace_one(raw: str, sugg: str):
+        text = st.session_state.get("pairs_text", "") or ""
+        pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
+        st.session_state["pairs_text"] = re.sub(pattern, sugg, text)
+
+    def _replace_all(suggs: list[tuple[str, str | None]]):
+        text = st.session_state.get("pairs_text", "") or ""
+        for raw, sugg in suggs:
+            if sugg:
+                pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
+                text = re.sub(pattern, sugg, text)
+        st.session_state["pairs_text"] = text
+
     if suggestions:
         st.markdown("**Name fixes:** click to apply")
         cols = st.columns(2)
-        any_fixable = False
+        any_fixable = any(sugg for _, sugg in suggestions)
         for i, (raw, sugg) in enumerate(suggestions):
             if sugg:
-                any_fixable = True
-                if cols[i % 2].button(f"Replace “{raw}” → “{sugg}”", key=f"fix_{i}"):
-                    text = st.session_state["pairs_text"] or ""
-                    pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
-                    st.session_state["pairs_text"] = re.sub(pattern, sugg, text)
-                    st.rerun()
+                cols[i % 2].button(
+                    f"Replace “{raw}” → “{sugg}”",
+                    key=f"fix_{i}",
+                    on_click=_replace_one,
+                    args=(raw, sugg),
+                )
             else:
                 cols[i % 2].markdown(f"⚠️ **{raw}** — no close match found")
-        if any_fixable and st.button("Apply all fixes"):
-            text = st.session_state["pairs_text"] or ""
-            for raw, sugg in suggestions:
-                if sugg:
-                    pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
-                    text = re.sub(pattern, sugg, text)
-            st.session_state["pairs_text"] = text
-            st.rerun()
+        if any_fixable:
+            st.button(
+                "Apply all fixes",
+                key="apply_all_fixes",
+                on_click=_replace_all,
+                args=(suggestions,),
+            )
 
     # Apply grouping rules (only validated canonical pairs so far)
+    Scheduler2.GROUP_PAIRS = valid_pairs
+
     Scheduler2.GROUP_PAIRS = valid_pairs
 
     # ── Run Scheduler ─────────────────────────────────────────────────────────
