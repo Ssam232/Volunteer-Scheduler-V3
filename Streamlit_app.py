@@ -103,8 +103,8 @@ if uploader:
     def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
         # Parse pairs text line-by-line, replace exact tokens between commas
         lines = (text or "").splitlines()
-        new_lines = []
         rep_map = {raw: sugg for raw, sugg in replacements if sugg}
+        new_lines = []
         for line in lines:
             parts = [p.strip() for p in line.split(',')]
             new_parts = [rep_map.get(p, p) for p in parts if p]
@@ -146,8 +146,6 @@ if uploader:
             )
 
     # Apply grouping rules (only validated canonical pairs so far)
-    Scheduler2.GROUP_PAIRS = valid_pairs
-
     Scheduler2.GROUP_PAIRS = valid_pairs
 
     # ── Run Scheduler ─────────────────────────────────────────────────────────
@@ -308,11 +306,7 @@ if st.session_state.sched_df is not None:
     )
     st.markdown(html, unsafe_allow_html=True)
 
-    # Grouping results table
-    if st.session_state.group_report is not None and not st.session_state.group_report.empty:
-        st.subheader("Group-Together Results")
-        st.dataframe(st.session_state.group_report, use_container_width=True)
-
+    
     # Preference Breakdown
     st.subheader("Preference Breakdown")
     st.dataframe(breakdown_df, use_container_width=True)
