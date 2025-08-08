@@ -208,11 +208,6 @@ def solve_schedule(volunteers, roles, shifts, weights):
     mentors = [v for v in volunteers if roles.get(v) == "mentor"]
     # MIT is NOT counted as mentor
 
-    # If mentees exist but there are zero mentors at all, strict solve cannot satisfy coverage.
-    # Raise to trigger relaxed solve, where we'll forbid assigning mentees.
-    if mentees and not mentors:
-        raise RuntimeError("No mentors in data: cannot satisfy mentee-coverage rule.")
-
     clean_pairs = _clean_pairs(volunteers, GROUP_PAIRS)
 
     # ----- Phase 1 -----
@@ -227,12 +222,20 @@ def solve_schedule(volunteers, roles, shifts, weights):
         for s in shifts:
             model1.Add(x1[(a, s)] == x1[(b, s)])
 
-    if mentees and mentors:
-        y1 = {s: model1.NewBoolVar(f"y1_{s}") for s in shifts}
+    # Coverage with big-M (robust):
+    # Let z1_s be 1 if a mentor is present on shift s.
+    # If any mentee is assigned to s, z1_s must be 1 (sum(mentee_s) <= MAX * z1_s),
+    # and at least one mentor must be assigned (sum(mentor_s) >= z1_s).
+    if mentees:
+        z1 = {s: model1.NewBoolVar(f"z1_mentor_present_{s}") for s in shifts}
         for s in shifts:
-            model1.Add(sum(x1[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y1[s])
-            model1.Add(sum(x1[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y1[s].Not())
-            model1.Add(sum(x1[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y1[s])
+            model1.Add(sum(x1[(v, s)] for v in mentees) <= MAX_PER_SHIFT * z1[s])
+            if mentors:
+                model1.Add(sum(x1[(v, s)] for v in mentors) >= z1[s])
+            else:
+                # No mentors at all -> the only way for z1[s] to be 1 would be impossible,
+                # so this naturally prevents mentees on any shift.
+                model1.Add(z1[s] == 0)
 
     model1.Maximize(
         sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x1[(v, s)]
@@ -259,12 +262,15 @@ def solve_schedule(volunteers, roles, shifts, weights):
     for a, b in clean_pairs:
         for s in shifts:
             model2.Add(x2[(a, s)] == x2[(b, s)])
-    if mentees and mentors:
-        y2 = {s: model2.NewBoolVar(f"y2_{s}") for s in shifts}
+
+    if mentees:
+        z2 = {s: model2.NewBoolVar(f"z2_mentor_present_{s}") for s in shifts}
         for s in shifts:
-            model2.Add(sum(x2[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y2[s])
-            model2.Add(sum(x2[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y2[s].Not())
-            model2.Add(sum(x2[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y2[s])
+            model2.Add(sum(x2[(v, s)] for v in mentees) <= MAX_PER_SHIFT * z2[s])
+            if mentors:
+                model2.Add(sum(x2[(v, s)] for v in mentors) >= z2[s])
+            else:
+                model2.Add(z2[s] == 0)
 
     # Lock Phase 1 optimum
     model2.Add(
@@ -317,17 +323,14 @@ def solve_relaxed(volunteers, roles, shifts, weights):
     mentees = [v for v in volunteers if roles.get(v) == "mentee"]
     mentors = [v for v in volunteers if roles.get(v) == "mentor"]
 
-    if mentees and not mentors:
-        # No mentors at all → forbid assigning mentees anywhere in relaxed solve.
+    if mentees:
+        z = {s: model.NewBoolVar(f"z_relax_mentor_present_{s}") for s in shifts}
         for s in shifts:
-            model.Add(sum(x[(v, s)] for v in mentees) == 0)
-    else:
-        if mentees and mentors:
-            y = {s: model.NewBoolVar(f"y_{s}") for s in shifts}
-            for s in shifts:
-                model.Add(sum(x[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y[s])
-                model.Add(sum(x[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y[s].Not())
-                model.Add(sum(x[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y[s])
+            model.Add(sum(x[(v, s)] for v in mentees) <= MAX_PER_SHIFT * z[s])
+            if mentors:
+                model.Add(sum(x[(v, s)] for v in mentors) >= z[s])
+            else:
+                model.Add(z[s] == 0)
 
     model.Maximize(sum(x[(v, s)] for v in volunteers for s in shifts))
 
