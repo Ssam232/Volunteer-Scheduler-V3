@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import io, re, difflib
 import Scheduler2  # scheduling core module
-from Scheduler2 import build_schedule, MAX_PER_SHIFT, load_preferences
+from Scheduler2 import build_schedule, MAX_PER_SHIFT
 
 # ── Page configuration ──────────────────────────────────────────────────────
 st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3", layout="wide")
@@ -11,9 +11,29 @@ st.title("📅 PEMRAP Volunteer Scheduler V3")
 # ── Initialize session state ─────────────────────────────────────────────────
 if "df_raw" not in st.session_state:
     st.session_state.df_raw = None
-if "sched_df" not in st.session_state:
-    st.session_state.sched_df = None
-    st.session_state.breakdown_df = None
+for key in ("sched_df", "breakdown_df", "group_report"):
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
+    """Build a clean Name list for the Group UI from the raw sheet.
+    Tries First/Last -> Name -> first two columns. Case/space insensitive.
+    """
+    cols = {c.lower(): c for c in df.columns}
+    first = next((cols[k] for k in cols if 'first' in k and 'name' in k), None)
+    last  = next((cols[k] for k in cols if 'last'  in k and 'name' in k), None)
+    if first and last:
+        names = (df[first].astype(str).str.strip() + ' ' + df[last].astype(str).str.strip()).tolist()
+    elif 'name' in cols:
+        names = df[cols['name']].astype(str).tolist()
+    else:
+        names = (df.iloc[:,0].astype(str).str.strip() + ' ' + df.iloc[:,1].astype(str).str.strip()).tolist()
+    names = {re.sub(r'\s+', ' ', n).strip() for n in names if str(n).strip()}
+    return sorted(names)
+
+def norm_name(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s).strip()).lower()
 
 # ── File upload ──────────────────────────────────────────────────────────────
 uploader = st.file_uploader("Upload survey XLSX", type="xlsx")
@@ -22,6 +42,7 @@ if not uploader:
     st.session_state.df_raw = None
     st.session_state.sched_df = None
     st.session_state.breakdown_df = None
+    st.session_state.group_report = None
 
 if uploader:
     # Cache raw DataFrame
@@ -33,63 +54,55 @@ if uploader:
             st.stop()
     df_raw = st.session_state.df_raw
 
-    # Extract volunteers for grouping
-    try:
-        volunteers, _, _, _, _ = load_preferences(df_raw)
-    except Exception as e:
-        st.error(f"Error parsing preferences: {e}")
-        volunteers = []
+    # Build volunteer list for grouping UI (robust to column variations)
+    ui_names = extract_names_for_ui(df_raw)
+    vol_lookup = {norm_name(n): n for n in ui_names}
 
     # ── Group-Together Exceptions UI ─────────────────────────────────────────
     st.subheader("Group-Together Exceptions")
-    st.write("Enter each pair on its own line: First Last,First Last")
-
-    def _norm_name(s: str) -> str:
-        return re.sub(r"\s+", " ", str(s).strip()).lower()
+    st.write("Enter each pair on its own line: First Last, First Last")
+    st.write("_Leave blank and run if no exceptions._")
 
     pairs_input = st.text_area(
-        "Pairs (one per line)", placeholder="Alice Smith,Bob Jones", height=100
+        "Pairs (one per line)", placeholder="Alice Smith, Bob Jones", height=100
     ).strip()
 
-    # Build lookup: case/whitespace-insensitive
-    vol_lookup = {_norm_name(n): n for n in volunteers}
+    # Parse and validate pairs (case/space-insensitive; suggest fixes but don't block)
+    valid_pairs: list[tuple[str, str]] = []
+    typos: list[str] = []
+    raw_pairs: list[tuple[str, str]] = []
 
-    valid_pairs = []
-    typos = []
     if pairs_input:
         for line in pairs_input.splitlines():
             parts = [p.strip() for p in line.split(",") if p.strip()]
             if len(parts) != 2:
                 continue
             a_raw, b_raw = parts
-            a = vol_lookup.get(_norm_name(a_raw))
-            b = vol_lookup.get(_norm_name(b_raw))
+            raw_pairs.append((a_raw, b_raw))
+            a = vol_lookup.get(norm_name(a_raw))
+            b = vol_lookup.get(norm_name(b_raw))
             if a and b:
                 valid_pairs.append((a, b))
             else:
                 for raw in (a_raw, b_raw):
-                    if vol_lookup.get(_norm_name(raw)) is None:
-                        keys = list(vol_lookup.keys())
-                        sugg_key = difflib.get_close_matches(_norm_name(raw), keys, n=1, cutoff=0.6)
-                        if sugg_key:
-                            typos.append(f"{raw} (did you mean: {vol_lookup[sugg_key[0]]})")
-                        else:
-                            typos.append(raw)
+                    if vol_lookup.get(norm_name(raw)) is None:
+                        sugg_key = difflib.get_close_matches(norm_name(raw), list(vol_lookup.keys()), n=1, cutoff=0.6)
+                        typos.append(f"{raw} (did you mean: {vol_lookup[sugg_key[0]]})" if sugg_key else raw)
 
-    # Show typos but do NOT block scheduling
+    # Show typos but DO NOT block scheduling
     err_box = st.empty()
     if typos:
         err_box.error(f"Typo detected in group-together names: {typos}")
     else:
         err_box.empty()
 
-    # Apply grouping rules
+    # Apply grouping rules to the solver (only the validated pairs)
     Scheduler2.GROUP_PAIRS = valid_pairs
 
     # ── Run Scheduler ─────────────────────────────────────────────────────────
     if st.button("Run Scheduler"):
         sched_df, _, breakdown_df = build_schedule(df_raw)
-        # Parse Day/Shift
+        # Parse Day/Shift for grid
         if "Time Slot" in sched_df.columns:
             ts = sched_df["Time Slot"].astype(str)
             parts = ts.str.split(r"\s+", n=1, expand=True)
@@ -98,11 +111,65 @@ if uploader:
                 parts[1].str.replace(r"[–—−]", "-", regex=True).str.strip().fillna("")
             )
         else:
-            sched_df["Day"] = ""
-            sched_df["Shift"] = ""
+            sched_df["Day"], sched_df["Shift"] = "", ""
+
         # Save to session state
         st.session_state.sched_df = sched_df
         st.session_state.breakdown_df = breakdown_df
+
+        # Build a grouping-results report for the pairs the user typed
+        slot_by_name = (
+            sched_df[["Name", "Time Slot"]]
+            .dropna()
+            .groupby("Name")["Time Slot"].first()
+            .to_dict()
+        )
+        report_rows = []
+        for a_raw, b_raw in raw_pairs:
+            a_can = vol_lookup.get(norm_name(a_raw))
+            b_can = vol_lookup.get(norm_name(b_raw))
+            pair_label = f"{a_raw} & {b_raw}"
+            if not a_can or not b_can:
+                missing = []
+                if not a_can:
+                    missing.append(a_raw)
+                if not b_can:
+                    missing.append(b_raw)
+                report_rows.append({
+                    "Pair": pair_label,
+                    "Status": "Skipped",
+                    "Reason": f"Name not recognized: {', '.join(missing)}"
+                })
+                continue
+            sa = slot_by_name.get(a_can)
+            sb = slot_by_name.get(b_can)
+            if sa and sb:
+                if sa == sb:
+                    report_rows.append({
+                        "Pair": f"{a_can} & {b_can}",
+                        "Status": "Grouped ✓",
+                        "Reason": f"Assigned to {sa}"
+                    })
+                else:
+                    # This should not happen if grouping constraints are enforced;
+                    # include anyway in case the user re-runs without applying pairs.
+                    report_rows.append({
+                        "Pair": f"{a_can} & {b_can}",
+                        "Status": "Not grouped ✗",
+                        "Reason": f"{a_can} at {sa}, {b_can} at {sb} (check capacity/coverage)"
+                    })
+            else:
+                missing = []
+                if not sa:
+                    missing.append(a_can)
+                if not sb:
+                    missing.append(b_can)
+                report_rows.append({
+                    "Pair": f"{a_can} & {b_can}",
+                    "Status": "Unassigned",
+                    "Reason": f"{', '.join(missing)} not in schedule (infeasible with constraints)"
+                })
+        st.session_state.group_report = pd.DataFrame(report_rows)
 
 # ── Display Results ──────────────────────────────────────────────────────────
 if st.session_state.sched_df is not None:
@@ -113,7 +180,7 @@ if st.session_state.sched_df is not None:
     desired_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
     days = [d for d in desired_days if d in sched_df["Day"].unique()]
 
-    # Sort shifts chronologically, robust to malformed entries
+    # Sort shifts chronologically (robust)
     raw_shifts = [str(s).strip() for s in sched_df["Shift"].dropna().unique()]
     def shift_key(s):
         try:
@@ -168,8 +235,11 @@ if st.session_state.sched_df is not None:
         unsafe_allow_html=True,
     )
     st.markdown(html, unsafe_allow_html=True)
-    # Italic note below the schedule
-    st.markdown("_This note is italicized. Replace with your own text._", unsafe_allow_html=True)
+
+    # ── Grouping results (success & reasons) ──────────────────────────────────
+    if st.session_state.group_report is not None and not st.session_state.group_report.empty:
+        st.subheader("Group-Together Results")
+        st.dataframe(st.session_state.group_report, use_container_width=True)
 
     # ── Preference Breakdown ───────────────────────────────────────────────────
     st.subheader("Preference Breakdown")
@@ -250,4 +320,3 @@ if st.session_state.sched_df is not None:
     )
 
 # Note: Refresh (F5) to reset
-
