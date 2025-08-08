@@ -19,15 +19,15 @@ def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
     Tries First/Last -> Name -> first two columns. Case/space insensitive.
     """
     cols = {c.lower(): c for c in df.columns}
-    first = next((cols[k] for k in cols if "first" in k and "name" in k), None)
-    last  = next((cols[k] for k in cols if "last"  in k and "name" in k), None)
+    first = next((cols[k] for k in cols if 'first' in k and 'name' in k), None)
+    last  = next((cols[k] for k in cols if 'last'  in k and 'name' in k), None)
     if first and last:
-        names = (df[first].astype(str).str.strip() + " " + df[last].astype(str).str.strip()).tolist()
-    elif "name" in cols:
-        names = df[cols["name"]].astype(str).tolist()
+        names = (df[first].astype(str).str.strip() + ' ' + df[last].astype(str).str.strip()).tolist()
+    elif 'name' in cols:
+        names = df[cols['name']].astype(str).tolist()
     else:
-        names = (df.iloc[:, 0].astype(str).str.strip() + " " + df.iloc[:, 1].astype(str).str.strip()).tolist()
-    names = {re.sub(r"\s+", " ", n).strip() for n in names if str(n).strip()}
+        names = (df.iloc[:,0].astype(str).str.strip() + ' ' + df.iloc[:,1].astype(str).str.strip()).tolist()
+    names = {re.sub(r'\s+', ' ', n).strip() for n in names if str(n).strip()}
     return sorted(names)
 
 def norm_name(s: str) -> str:
@@ -35,7 +35,6 @@ def norm_name(s: str) -> str:
 
 # ── File upload ──────────────────────────────────────────────────────────────
 uploader = st.file_uploader("Upload survey XLSX", type="xlsx")
-
 # Reset the app when the file is removed
 if not uploader:
     st.session_state.df_raw = None
@@ -108,10 +107,11 @@ if uploader:
         rep_map = {raw: sugg for raw, sugg in replacements if sugg}
         new_lines = []
         for line in lines:
-            parts = [p.strip() for p in line.split(",")]
+            parts = [p.strip() for p in line.split(',')]
             new_parts = [rep_map.get(p, p) for p in parts if p]
-            new_lines.append(", ".join(new_parts))
-        return "\n".join(new_lines)
+            new_lines.append(', '.join(new_parts))
+        return "
+".join(new_lines)
 
     def _replace_one_cb(raw: str, sugg: str):
         text = st.session_state.get("pairs_text", "") or ""
@@ -131,7 +131,7 @@ if uploader:
         for i, (raw, sugg) in enumerate(suggestions):
             if sugg:
                 cols[i % 2].button(
-                    f'Replace "{raw}" -> "{sugg}"',
+                    f"Replace “{raw}” → “{sugg}”",
                     key=f"fix_{i}",
                     on_click=_replace_one_cb,
                     args=(raw, sugg),
@@ -197,44 +197,54 @@ if uploader:
         for a_raw, b_raw in raw_pairs_run:
             a_can = vol_lookup.get(norm_name(a_raw))
             b_can = vol_lookup.get(norm_name(b_raw))
+
+            # Name not recognized
             if not a_can or not b_can:
                 missing = []
                 if not a_can:
                     missing.append(a_raw)
                 if not b_can:
                     missing.append(b_raw)
+                nice = ", ".join(missing)
                 report_rows.append({
                     "Pair": f"{a_raw} & {b_raw}",
                     "Status": "Skipped",
-                    "Reason": f"Name not recognized: {', '.join(missing)}"
+                    "Details": f"We couldn't find {nice} in the uploaded list. Use the suggestions above to fix the spelling."
                 })
                 continue
+
+            # Look up final placements
             sa = slot_by_name.get(a_can)
             sb = slot_by_name.get(b_can)
-            if sa and sb:
-                if sa == sb:
-                    report_rows.append({
-                        "Pair": f"{a_can} & {b_can}",
-                        "Status": "Grouped ✓",
-                        "Reason": f"Assigned to {sa}"
-                    })
-                else:
-                    report_rows.append({
-                        "Pair": f"{a_can} & {b_can}",
-                        "Status": "Not grouped ✗",
-                        "Reason": f"{a_can} at {sa}, {b_can} at {sb} (check capacity/coverage)"
-                    })
-            else:
-                missing = []
-                if not sa:
-                    missing.append(a_can)
-                if not sb:
-                    missing.append(b_can)
+
+            if sa and sb and sa == sb:
                 report_rows.append({
                     "Pair": f"{a_can} & {b_can}",
-                    "Status": "Not in schedule",
-                    "Reason": f"{', '.join(missing)} not placed under constraints"
+                    "Status": "Grouped ✓",
+                    "Details": f"Scheduled together on **{sa}**."
                 })
+                continue
+
+            if sa and sb and sa != sb:
+                report_rows.append({
+                    "Pair": f"{a_can} & {b_can}",
+                    "Status": "Not grouped ✗",
+                    "Details": f"Both were scheduled but on different shifts — **{a_can} → {sa}**, **{b_can} → {sb}**. Try freeing space or adjusting their preferences."
+                })
+                continue
+
+            not_placed = []
+            if not sa:
+                not_placed.append(a_can)
+            if not sb:
+                not_placed.append(b_can)
+            who = f"{not_placed[0]} and {not_placed[1]}" if len(not_placed) == 2 else not_placed[0]
+            report_rows.append({
+                "Pair": f"{a_can} & {b_can}",
+                "Status": "Not in schedule",
+                "Details": f"We couldn't place {who} given availability, capacity, and mentor/mentee rules."
+            })
+
         st.session_state.group_report = pd.DataFrame(report_rows)
 
 # ── Display Results ──────────────────────────────────────────────────────────
@@ -263,7 +273,7 @@ if st.session_state.sched_df is not None:
         if sh in grid and d in grid[sh]:
             grid[sh][d].append((row["Name"], row.get("Role", ""), bool(row["Fallback"])))
 
-    # Grouping results table (shown BEFORE the schedule preview)
+    # Grouping results table (now shown BEFORE the schedule preview)
     if st.session_state.group_report is not None and not st.session_state.group_report.empty:
         st.subheader("Group-Together Results")
         st.dataframe(st.session_state.group_report, use_container_width=True)
@@ -283,9 +293,9 @@ if st.session_state.sched_df is not None:
                 entries = grid.get(sh, {}).get(d, [])
                 if i < len(entries):
                     name, role, fb = entries[i]
-                    if role == "mentor":
+                    if role == 'mentor':
                         cell = f"<strong>{name}</strong>"
-                    elif role == "mentee":
+                    elif role == 'mentee':
                         cell = (
                             "<span style='background:#add8e6;padding:2px 4px;border-radius:3px'>"
                             f"{name}</span>"
@@ -293,7 +303,7 @@ if st.session_state.sched_df is not None:
                     else:
                         cell = name
                     if fb:
-                        cell += " *"
+                        cell += ' *'
                 html += (
                     f"<td style='border:1px solid #ddd;padding:8px;vertical-align:top;'>{cell}</td>"
                 )
@@ -307,6 +317,7 @@ if st.session_state.sched_df is not None:
     )
     st.markdown(html, unsafe_allow_html=True)
 
+    
     # Preference Breakdown
     st.subheader("Preference Breakdown")
     st.dataframe(breakdown_df, use_container_width=True)
@@ -362,7 +373,7 @@ if st.session_state.sched_df is not None:
                         ppl = grid_x.get(sh, {}).get(day, [])
                         if i < len(ppl):
                             nm, rl, fb_flag = ppl[i]
-                            fmt = mentor_fmt if rl == "mentor" else mentee_fmt if rl == "mentee" else vol_fmt
+                            fmt = mentor_fmt if rl == 'mentor' else mentee_fmt if rl == 'mentee' else vol_fmt
                             ws.write(row_idx + i, c, nm + (" *" if fb_flag else ""), fmt)
                         else:
                             ws.write_blank(row_idx + i, c, None, border)
