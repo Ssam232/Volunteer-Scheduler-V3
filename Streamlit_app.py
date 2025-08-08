@@ -27,11 +27,13 @@ def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
     first = next((cols[k] for k in cols if "first" in k and "name" in k), None)
     last  = next((cols[k] for k in cols if "last"  in k and "name" in k), None)
     if first and last:
-        names = (df[first].astype(str).str.strip() + " " + df[last].astype(str).str.strip()).tolist()
+        names = (df[first].astype(str).str.strip() + " " +
+                 df[last].astype(str).str.strip()).tolist()
     elif "name" in cols:
         names = df[cols["name"]].astype(str).tolist()
     else:
-        names = (df.iloc[:, 0].astype(str).str.strip() + " " + df.iloc[:, 1].astype(str).str.strip()).tolist()
+        names = (df.iloc[:, 0].astype(str).str.strip() + " " +
+                 df.iloc[:, 1].astype(str).str.strip()).tolist()
     names = {re.sub(r"\s+", " ", n).strip() for n in names if str(n).strip()}
     return sorted(names)
 
@@ -39,7 +41,7 @@ def norm_name(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip()).lower()
 
 def style_group_report(df: pd.DataFrame):
-    """Darker row colors for dark backgrounds (kept)."""
+    """Darker row colors for dark backgrounds (results table)."""
     def _row_style(row):
         status = str(row.get("Status", ""))
         if "Grouped ✓" in status:
@@ -129,8 +131,7 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
 
         # mentor coverage if any mentee present
         roles_here = [rl for _, rl, _ in entries]
-        roles_map = roles  # from load_preferences
-        roles_aug = roles_here + [roles_map.get(a_can, ""), roles_map.get(b_can, "")]
+        roles_aug = roles_here + [roles.get(a_can, ""), roles.get(b_can, "")]
         any_mentee = any(r == "mentee" for r in roles_aug)
         any_mentor = any(r == "mentor" for r in roles_aug)
         if any_mentee and not any_mentor:
@@ -250,11 +251,13 @@ def validate_names(df_raw: pd.DataFrame):
     first = next((cols[k] for k in cols if "first" in k and "name" in k), None)
     last  = next((cols[k] for k in cols if "last"  in k and "name" in k), None)
     if first and last:
-        series = (df_raw[first].astype(str).str.strip() + " " + df_raw[last].astype(str).str.strip())
+        series = (df_raw[first].astype(str).str.strip() + " " +
+                  df_raw[last].astype(str).str.strip())
     elif "name" in cols:
         series = df_raw[cols["name"]].astype(str).str.strip()
     else:
-        series = (df_raw.iloc[:,0].astype(str).str.strip() + " " + df_raw.iloc[:,1].astype(str).str.strip())
+        series = (df_raw.iloc[:,0].astype(str).str.strip() + " " +
+                  df_raw.iloc[:,1].astype(str).str.strip())
 
     key_to_names = {}
     for raw in series.dropna().tolist():
@@ -458,7 +461,7 @@ if st.session_state.sched_df is not None:
     )
     st.markdown(html, unsafe_allow_html=True)
 
-    # Legend BELOW the preview (Forced shown only if present)
+    # Legend BELOW the preview (Forced shown only if present) + "Current volunteer"
     legend = (
         "<div style='margin: 12px 0;'>"
         "<span style='display:inline-block;margin-right:16px;'><strong>Mentor</strong></span>"
@@ -467,6 +470,7 @@ if st.session_state.sched_df is not None:
     )
     if has_forced:
         legend += "<span style='display:inline-block;margin-right:16px;'>* Forced</span>"
+    legend += "<span style='display:inline-block;margin-right:16px;'>Current volunteer</span>"
     legend += "</div>"
     st.markdown(legend, unsafe_allow_html=True)
 
@@ -540,8 +544,14 @@ if st.session_state.sched_df is not None:
             ws.write(row_idx, 0, "Legend:", border)
             ws.write(row_idx, 1, "Mentor", mentor_fmt)
             ws.write(row_idx, 2, "Mentee", mentee_fmt)
+
+            next_col = 3
             if has_forced:
-                ws.write(row_idx, 3, "* Forced", border)
+                ws.write(row_idx, next_col, "* Forced", border)
+                next_col += 1
+
+            # Current volunteer (unformatted)
+            ws.write(row_idx, next_col, "Current volunteer", border)
 
             # Preferences & Fallback sheets
             breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
