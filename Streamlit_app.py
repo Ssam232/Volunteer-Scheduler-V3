@@ -51,11 +51,14 @@ def style_group_report(df: pd.DataFrame):
         else:
             bg, fg = "#263238", "#eceff1"   # slate bg, light text
         return [f"background-color: {bg}; color: {fg};"] * len(row)
+    return df.style.apply(_row_style, axis=1).set_properties(**{"white-space": "nowrap"})
 
-    styler = df.style.apply(_row_style, axis=1).set_properties(**{"white-space": "nowrap"})
-    return styler
-
-def build_placement_lookup(sched_df: pd.DataFrame):
+def build_placement_maps(sched_df: pd.DataFrame):
+    """
+    Return two dicts keyed by normalized name:
+      placed_by_key[name] -> 'Friday 10:00-14:00' (friendly slot)
+      forced_by_key[name] -> True/False from 'Fallback'
+    """
     tmp = sched_df.copy()
     if "Day" not in tmp.columns or "Shift" not in tmp.columns:
         ts_tmp = tmp["Time Slot"].astype(str)
@@ -63,16 +66,20 @@ def build_placement_lookup(sched_df: pd.DataFrame):
         tmp["Day"] = parts_tmp[0].str.strip().str.title()
         tmp["Shift"] = parts_tmp[1].str.replace(r"[–—−]", "-", regex=True).str.strip()
     tmp["_key"] = tmp["Name"].map(norm_name)
-    placed = {}
+
+    placed_by_key: dict[str, str] = {}
+    forced_by_key: dict[str, bool] = {}
+
     for _, r in tmp.iterrows():
         key = r["_key"]
         day = str(r.get("Day", "")).strip()
         shf = str(r.get("Shift", "")).strip()
         ts_label = str(r.get("Time Slot", "")).strip()
         label = f"{day} {shf}".strip() if (day and shf) else ts_label
-        if key not in placed:
-            placed[key] = label
-    return placed
+        if key not in placed_by_key:
+            placed_by_key[key] = label
+            forced_by_key[key] = bool(r.get("Fallback", False))
+    return placed_by_key, forced_by_key
 
 def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
     """Replace exact tokens between commas across lines."""
@@ -119,8 +126,8 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     st.session_state.sched_df = sched_df
     st.session_state.breakdown_df = breakdown_df
 
-    # Build group report
-    placed_by_key = build_placement_lookup(sched_df)
+    # Build group report (with forced indication)
+    placed_by_key, forced_by_key = build_placement_maps(sched_df)
     report_rows = []
     for a_raw, b_raw in raw_pairs_run:
         a_can = vol_lookup.get(norm_name(a_raw))
@@ -142,10 +149,16 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
         sb = placed_by_key.get(norm_name(b_can))
 
         if sa and sb and sa == sb:
+            fa = forced_by_key.get(norm_name(a_can), False)
+            fb_ = forced_by_key.get(norm_name(b_can), False)
+            forced_names = [n for n, f in ((a_can, fa), (b_can, fb_)) if f]
+            details = f"Scheduled together on **{sa}**."
+            if forced_names:
+                details += " (forced for " + ", ".join(forced_names) + ")"
             report_rows.append({
                 "Pair": f"{a_can} & {b_can}",
                 "Status": "Grouped ✓",
-                "Details": f"Scheduled together on **{sa}**."
+                "Details": details
             })
             continue
 
@@ -210,9 +223,7 @@ if uploader:
         height=100,
     ).strip()
 
-    valid_pairs_preview: list[tuple[str, str]] = []
     suggestions: list[tuple[str, str | None]] = []  # (raw_name, suggested or None)
-
     if pairs_input:
         for line in pairs_input.splitlines():
             parts = [p.strip() for p in line.split(",") if p.strip()]
@@ -230,13 +241,8 @@ if uploader:
 
             a_can, a_sugg = canon_or_suggest(a_raw)
             b_can, b_sugg = canon_or_suggest(b_raw)
-            if a_can and b_can:
-                valid_pairs_preview.append((a_can, b_can))
-            else:
-                if not a_can:
-                    suggestions.append((a_raw, a_sugg))
-                if not b_can:
-                    suggestions.append((b_raw, b_sugg))
+            if not a_can: suggestions.append((a_raw, a_sugg))
+            if not b_can: suggestions.append((b_raw, b_sugg))
 
     # Clickable suggestions — and auto-run after each fix
     def _apply_and_rerun(replacements: list[tuple[str, str]]):
