@@ -41,7 +41,7 @@ def norm_name(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip()).lower()
 
 def style_group_report(df: pd.DataFrame):
-    """Darker row colors for dark backgrounds (results table)."""
+    """Darker row colors for readability."""
     def _row_style(row):
         status = str(row.get("Status", ""))
         if "Grouped ✓" in status:
@@ -393,8 +393,7 @@ if st.session_state.sched_df is not None:
     sched_df = st.session_state.sched_df
     breakdown_df = st.session_state.breakdown_df
     has_forced = bool(sched_df["Fallback"].any())
-    # NEW: detect if any MIT is present in the schedule (for legend visibility)
-    has_mit = sched_df["Role"].astype(str).str.lower().eq("mit").any()
+    has_mit = sched_df["Role"].astype(str).str.lower().eq("mit").any()  # show MIT legend only if present
 
     # Order days Mon→Sun
     desired_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -446,7 +445,7 @@ if st.session_state.sched_df is not None:
                     elif role == "mentee":
                         cell = ("<span style='background:#ADD8E6; padding:2px 4px; "
                                 "border-radius:3px'>" + f"{name}</span>")
-                    elif role == "mit":  # NEW: italicize MIT
+                    elif role == "mit":  # italicize MIT in web grid
                         cell = f"<em>{name}</em>"
                     else:
                         cell = name
@@ -493,17 +492,17 @@ if st.session_state.sched_df is not None:
     else:
         st.write("_None_")
 
-    # ── Excel export with formatted grid (unchanged) ─────────────────────────
+    # ── Excel export with formatted grid (now includes italic MIT + conditional legend) ──
     def to_excel_bytes():
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             wb = writer.book
             # Formats
-            border = wb.add_format({"border": 1})
+            border     = wb.add_format({"border": 1})
             mentor_fmt = wb.add_format({"border": 1, "bold": True})
             mentee_fmt = wb.add_format({"border": 1, "bg_color": "#ADD8E6"})
-            vol_fmt = wb.add_format({"border": 1})
-            # (We are NOT italicizing MIT in Excel grid per your request—Streamlit only.)
+            mit_fmt    = wb.add_format({"border": 1, "italic": True})  # italic MIT in Excel
+            vol_fmt    = wb.add_format({"border": 1})
 
             # Local day/shift lists derived from the current schedule
             days_local = [d for d in ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -537,7 +536,10 @@ if st.session_state.sched_df is not None:
                         ppl = grid_x.get(sh, {}).get(day, [])
                         if i < len(ppl):
                             nm, rl, fb_flag = ppl[i]
-                            fmt = mentor_fmt if rl == "mentor" else mentee_fmt if rl == "mentee" else vol_fmt
+                            fmt = (mentor_fmt if rl == "mentor" else
+                                   mentee_fmt if rl == "mentee" else
+                                   mit_fmt    if rl == "mit" else
+                                   vol_fmt)
                             ws.write(row_idx + i, c, nm + (" *" if fb_flag else ""), fmt)
                         else:
                             ws.write_blank(row_idx + i, c, None, border)
@@ -549,15 +551,14 @@ if st.session_state.sched_df is not None:
             # Leave a blank row, then a legend under the grid
             row_idx += 1
             ws.write(row_idx, 0, "Legend:", border)
-            ws.write(row_idx, 1, "Mentor", mentor_fmt)
-            ws.write(row_idx, 2, "Mentee", mentee_fmt)
-
-            next_col = 3
+            col = 1
+            ws.write(row_idx, col, "Mentor", mentor_fmt); col += 1
+            ws.write(row_idx, col, "Mentee", mentee_fmt); col += 1
+            if has_mit:
+                ws.write(row_idx, col, "Mentor in training", mit_fmt); col += 1
             if has_forced:
-                ws.write(row_idx, next_col, "* Forced", border)
-                next_col += 1
-
-            ws.write(row_idx, next_col, "Current volunteer", border)
+                ws.write(row_idx, col, "* Forced", border); col += 1
+            ws.write(row_idx, col, "Current volunteer", border)
 
             # Preferences & Fallback sheets
             breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
