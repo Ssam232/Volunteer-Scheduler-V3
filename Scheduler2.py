@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 from ortools.sat.python import cp_model
 
@@ -10,44 +11,66 @@ FALLBACK_WEIGHT = 0
 GROUP_PAIRS = []  # list of ("NameA","NameB") pairs to lock together
 
 # ----------------------------------
+# Helpers
+# ----------------------------------
+def _normalize_role(s: str) -> str:
+    """
+    Map free-text roles to canonical tags:
+      - 'mentor' -> 'mentor'
+      - 'mentee' / 'trainee' -> 'mentee'
+      - 'mentor in training' / 'mit' -> 'mit' (NEW: does NOT count as mentor)
+      - everything else -> 'volunteer'
+    """
+    r = re.sub(r"\s+", " ", str(s).strip().lower())
+    r = r.replace("-", " ")
+    if r == "mentor":
+        return "mentor"
+    if r in {"mentee", "trainee"}:
+        return "mentee"
+    if r in {"mentor in training", "mit", "mentor in training (mit)"}:
+        return "mit"
+    return "volunteer"
+
+# ----------------------------------
 # Load and parse preferences
 # ----------------------------------
 def load_preferences(df: pd.DataFrame):
     df = df.copy()
     cols_lower = {c.lower(): c for c in df.columns}
+
     # Build Name column
     first_cols = [cols_lower[k] for k in cols_lower if 'first' in k and 'name' in k]
-    last_cols = [cols_lower[k] for k in cols_lower if 'last' in k and 'name' in k]
+    last_cols  = [cols_lower[k] for k in cols_lower if 'last'  in k and 'name' in k]
     if first_cols and last_cols:
         df['Name'] = df[first_cols[0]].astype(str) + ' ' + df[last_cols[0]].astype(str)
     elif 'name' in cols_lower:
         df['Name'] = df[cols_lower['name']].astype(str)
     else:
         df['Name'] = df.iloc[:, 0].astype(str) + ' ' + df.iloc[:, 1].astype(str)
+
     # Role column
     if 'role' not in cols_lower:
         raise ValueError("Missing 'Role' column.")
     role_col = cols_lower['role']
+
     # Volunteers list sorted for reproducibility
     volunteers = sorted(df['Name'].astype(str).tolist())
     roles = {}
     prefs_map = {}
+
     # Identify preference columns
     pref_cols = [c for c in df.columns if 'choice' in c.lower() or 'availability' in c.lower()]
     if not pref_cols:
         raise ValueError("No preference columns detected.")
+
     for _, row in df.iterrows():
         name = row['Name']
-        rv = str(row[role_col]).strip().lower()
-        if 'mentor' in rv:
-            roles[name] = 'mentor'
-        elif 'mentee' in rv:
-            roles[name] = 'mentee'
-        else:
-            roles[name] = 'volunteer'
+        roles[name] = _normalize_role(row.get(role_col, ''))  # <-- updated to use safe parser
         prefs_map[name] = [str(row[c]) for c in pref_cols if pd.notna(row[c])]
+
     # Distinct sorted shifts
     shifts = sorted({slot for prefs in prefs_map.values() for slot in prefs})
+
     # Build weight matrix
     weights = {}
     for name, prefs in prefs_map.items():
@@ -56,45 +79,55 @@ def load_preferences(df: pd.DataFrame):
     for name in volunteers:
         for slot in shifts:
             weights.setdefault((name, slot), FALLBACK_WEIGHT)
+
     return volunteers, roles, shifts, weights, prefs_map
 
 # ----------------------------------
-# Two-phase solve
+# Two-phase solve (lexicographic)
+#   Phase 1: maximize #non-fallback assignments
+#   Phase 2: maximize preference weight given Phase 1 optimum
 # ----------------------------------
 def solve_schedule(volunteers, roles, shifts, weights):
-    # Prepare sorted lists
     volunteers = sorted(volunteers)
     shifts = sorted(shifts)
+
     # Precompute mentees/mentors
+    # NOTE: 'mit' is intentionally NOT treated as mentor
     mentees = [v for v in volunteers if roles[v] == 'mentee']
     mentors = [v for v in volunteers if roles[v] == 'mentor']
 
-    # Phase 1: maximize non-fallback assignments
+    # ----- Phase 1 -----
     model1 = cp_model.CpModel()
     x1 = {(v, s): model1.NewBoolVar(f"x1_{v}_{s}") for v in volunteers for s in shifts}
+
     # One shift per volunteer
     for v in volunteers:
         model1.Add(sum(x1[(v, s)] for s in shifts) == 1)
+
     # Capacity per shift
     for s in shifts:
         model1.Add(sum(x1[(v, s)] for v in volunteers) <= MAX_PER_SHIFT)
+
     # Group-pairs constraint
     for a, b in GROUP_PAIRS:
         if a in volunteers and b in volunteers:
             for s in shifts:
                 model1.Add(x1[(a, s)] == x1[(b, s)])
-    # Mentor coverage: if any mentee assigned, at least one mentor
+
+    # Mentor coverage: if any mentee assigned, require ≥1 mentor (MIT does not count)
     if mentees and mentors:
         y1 = {s: model1.NewBoolVar(f"y1_{s}") for s in shifts}
         for s in shifts:
             model1.Add(sum(x1[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y1[s])
             model1.Add(sum(x1[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y1[s].Not())
             model1.Add(sum(x1[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y1[s])
+
     # Objective: maximize non-fallback count
     model1.Maximize(
         sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x1[(v, s)]
             for v in volunteers for s in shifts)
     )
+
     solver1 = cp_model.CpSolver()
     solver1.parameters.random_seed = 42
     solver1.parameters.num_search_workers = 1
@@ -104,9 +137,10 @@ def solve_schedule(volunteers, roles, shifts, weights):
         raise RuntimeError("No feasible schedule.")
     best_nonfb = int(solver1.ObjectiveValue())
 
-    # Phase 2: maximize preference score under minimal fallback
+    # ----- Phase 2 -----
     model2 = cp_model.CpModel()
     x2 = {(v, s): model2.NewBoolVar(f"x2_{v}_{s}") for v in volunteers for s in shifts}
+
     for v in volunteers:
         model2.Add(sum(x2[(v, s)] for s in shifts) == 1)
     for s in shifts:
@@ -121,15 +155,18 @@ def solve_schedule(volunteers, roles, shifts, weights):
             model2.Add(sum(x2[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y2[s])
             model2.Add(sum(x2[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y2[s].Not())
             model2.Add(sum(x2[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y2[s])
-    # Preserve Phase 1 result
+
+    # Preserve Phase 1 result (lexicographic)
     model2.Add(
         sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x2[(v, s)]
             for v in volunteers for s in shifts) == best_nonfb
     )
+
     # Objective: maximize weighted preferences
     model2.Maximize(
         sum(weights[(v, s)] * x2[(v, s)] for v in volunteers for s in shifts)
     )
+
     solver2 = cp_model.CpSolver()
     solver2.parameters.random_seed = 42
     solver2.parameters.num_search_workers = 1
@@ -143,7 +180,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
         if solver2.Value(var):
             schedule[s].append({
                 'Name': v,
-                'Role': roles[v],
+                'Role': roles[v],  # 'mit' will appear as-is; UI can style or ignore
                 'Fallback': weights[(v, s)] == FALLBACK_WEIGHT
             })
             assigned.add(v)
@@ -155,17 +192,22 @@ def solve_schedule(volunteers, roles, shifts, weights):
 def solve_relaxed(volunteers, roles, shifts, weights):
     volunteers = sorted(volunteers)
     shifts = sorted(shifts)
+
     model = cp_model.CpModel()
     x = {(v, s): model.NewBoolVar(f"x_{v}_{s}") for v in volunteers for s in shifts}
+
     for v in volunteers:
         model.Add(sum(x[(v, s)] for s in shifts) <= 1)
     for s in shifts:
         model.Add(sum(x[(v, s)] for v in volunteers) <= MAX_PER_SHIFT)
+
+    # Group pairs
     for a, b in GROUP_PAIRS:
         if a in volunteers and b in volunteers:
             for s in shifts:
                 model.Add(x[(a, s)] == x[(b, s)])
-    # Mentor coverage
+
+    # Mentor coverage (MIT does NOT count as mentor)
     mentees = [v for v in volunteers if roles[v] == 'mentee']
     mentors = [v for v in volunteers if roles[v] == 'mentor']
     if mentees and mentors:
@@ -174,12 +216,15 @@ def solve_relaxed(volunteers, roles, shifts, weights):
             model.Add(sum(x[(v, s)] for v in mentees) >= 1).OnlyEnforceIf(y[s])
             model.Add(sum(x[(v, s)] for v in mentees) == 0).OnlyEnforceIf(y[s].Not())
             model.Add(sum(x[(v, s)] for v in mentors) >= 1).OnlyEnforceIf(y[s])
+
     model.Maximize(sum(x[(v, s)] for v in volunteers for s in shifts))
+
     solver = cp_model.CpSolver()
     solver.parameters.random_seed = 42
     solver.parameters.num_search_workers = 1
     solver.parameters.max_time_in_seconds = 30
     solver.Solve(model)
+
     schedule = {s: [] for s in shifts}
     assigned = set()
     for (v, s), var in x.items():
@@ -251,4 +296,3 @@ def build_schedule(df: pd.DataFrame):
     unassigned_df = pd.DataFrame({'Name': unassigned})
     breakdown_df = compute_breakdown(sched, prefs_map)
     return sched_df, unassigned_df, breakdown_df
-
