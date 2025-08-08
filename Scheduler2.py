@@ -16,20 +16,22 @@ GROUP_PAIRS = []  # set by Streamlit: list of (nameA, nameB)
 # ----------------------------------
 def _normalize_role(s: str) -> str:
     """
-    Canonical roles:
-      - mentor -> 'mentor'
-      - mentee / trainee / new volunteer* -> 'mentee'
-      - mentor in training / mit -> 'mit' (does NOT count as mentor)
+    Canonical roles (more tolerant):
+      - contains 'mentor in training' or ' mit ' -> 'mit'
+      - contains 'mentor' (and NOT 'in training') -> 'mentor'
+      - contains 'mentee' or 'trainee' or 'new volunteer' -> 'mentee'
       - otherwise -> 'volunteer'
     """
     r = re.sub(r"\s+", " ", str(s).strip().lower())
     r = r.replace("-", " ")
-    if r == "mentor":
-        return "mentor"
-    if r in {"mentee", "trainee", "new volunteer", "newvolunteer", "new volunteer (mentee)"} or r.startswith("new volunteer"):
-        return "mentee"
-    if r in {"mentor in training", "mit", "mentor in training (mit)"}:
+    # match 'mentor in training' OR exact 'mit'
+    if "mentor in training" in r or re.search(r"\bmit\b", r):
         return "mit"
+    # any other 'mentor' counts as mentor
+    if "mentor" in r:
+        return "mentor"
+    if any(k in r for k in ["mentee", "trainee", "new volunteer", "newvolunteer"]):
+        return "mentee"
     return "volunteer"
 
 DAY_MAP = {
@@ -47,7 +49,7 @@ def _norm_slot(s: str) -> str:
     Conservative normalization for 'Day HH:MM-HH:MM' (or AM/PM-ish variants):
       - normalize unicode dashes to '-'
       - collapse spaces
-      - title-case day via DAY_MAP
+      - map day via DAY_MAP
     """
     s = str(s or "").strip()
     if not s:
@@ -222,10 +224,8 @@ def solve_schedule(volunteers, roles, shifts, weights):
         for s in shifts:
             model1.Add(x1[(a, s)] == x1[(b, s)])
 
-    # Coverage with big-M (robust):
-    # Let z1_s be 1 if a mentor is present on shift s.
-    # If any mentee is assigned to s, z1_s must be 1 (sum(mentee_s) <= MAX * z1_s),
-    # and at least one mentor must be assigned (sum(mentor_s) >= z1_s).
+    # Coverage with big-M:
+    # z1_s = 1 if a mentor is present on shift s
     if mentees:
         z1 = {s: model1.NewBoolVar(f"z1_mentor_present_{s}") for s in shifts}
         for s in shifts:
@@ -233,8 +233,6 @@ def solve_schedule(volunteers, roles, shifts, weights):
             if mentors:
                 model1.Add(sum(x1[(v, s)] for v in mentors) >= z1[s])
             else:
-                # No mentors at all -> the only way for z1[s] to be 1 would be impossible,
-                # so this naturally prevents mentees on any shift.
                 model1.Add(z1[s] == 0)
 
     model1.Maximize(
