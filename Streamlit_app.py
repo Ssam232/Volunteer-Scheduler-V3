@@ -92,7 +92,7 @@ def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
         new_lines.append(", ".join(new_parts))
     return "\n".join(new_lines)
 
-# ---- WHAT-IF EXPLAINER (UI Option 3) ---------------------------------------
+# ---- WHAT-IF EXPLAINER ------------------------------------------------------
 def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw: pd.DataFrame) -> str:
     """
     Heuristic post-solve explainer:
@@ -129,7 +129,9 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
 
         # mentor coverage if any mentee present
         roles_here = [rl for _, rl, _ in entries]
-        roles_aug = roles_here + [roles.get(a_can, ""), roles.get(b_can, "")]
+        # Get roles map from load_preferences result
+        roles_map = {v: roles[v] for v in roles}
+        roles_aug = roles_here + [roles_map.get(a_can, ""), roles_map.get(b_can, "")]
         any_mentee = any(r == "mentee" for r in roles_aug)
         any_mentor = any(r == "mentor" for r in roles_aug)
         if any_mentee and not any_mentor:
@@ -151,6 +153,7 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
 
 def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     """Run the solver using current pairs_text and store results in session_state."""
+    # Parse pairs for this run
     pairs_text = (st.session_state.get("pairs_text") or "").strip()
     valid_pairs_run, raw_pairs_run = [], []
     if pairs_text:
@@ -241,7 +244,7 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
 
     st.session_state.group_report = pd.DataFrame(report_rows)
 
-# ── Data hygiene (Option 9) ──────────────────────────────────────────────────
+# ── Data hygiene ─────────────────────────────────────────────────────────────
 def validate_names(df_raw: pd.DataFrame):
     """Warn if two rows normalize to the same name."""
     cols = {c.lower(): c for c in df_raw.columns}
@@ -304,11 +307,11 @@ if uploader:
             st.stop()
     df_raw = st.session_state.df_raw
 
-    # Data hygiene checks (show once per upload)
+    # Data hygiene checks
     validate_names(df_raw)
     validate_preference_strings(df_raw)
 
-    # Build volunteer list for grouping UI (robust to column variations)
+    # Build volunteer list for grouping UI
     ui_names = extract_names_for_ui(df_raw)
     vol_lookup = {norm_name(n): n for n in ui_names}
 
@@ -387,6 +390,7 @@ if uploader:
 if st.session_state.sched_df is not None:
     sched_df = st.session_state.sched_df
     breakdown_df = st.session_state.breakdown_df
+    has_forced = bool(sched_df["Fallback"].any())
 
     # Order days Mon→Sun
     desired_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -415,16 +419,25 @@ if st.session_state.sched_df is not None:
         styled = style_group_report(st.session_state.group_report)
         st.table(styled)
 
-    # ── HTML Grid ──────────────────────────────────────────────────────────────
-    html = "<table style='border-collapse: collapse; width:100%;'>"
+    # ── Dark-mode CSS + HTML Grid ─────────────────────────────────────────────
+    table_css = """
+    <style>
+      .schedule-table { border-collapse: collapse; width: 100%; color: #e8eaed; }
+      .schedule-table th, .schedule-table td { border: 1px solid #444; padding: 8px; }
+      .schedule-table th { background: #1f2933; }
+      .schedule-table .shift-cell { background: #111827; font-weight: 600; }
+      .schedule-table .mentee { background: #2a4158; padding: 2px 6px; border-radius: 4px; display: inline-block; }
+    </style>
+    """
+    st.markdown(table_css, unsafe_allow_html=True)
+
+    html = "<table class='schedule-table'>"
     html += "<tr><th></th>" + "".join(f"<th>{d}</th>" for d in days) + "</tr>"
     for sh in shifts:
         for i in range(MAX_PER_SHIFT):
             html += "<tr>"
             if i == 0:
-                html += (
-                    f"<td rowspan='{MAX_PER_SHIFT}' style='vertical-align:middle;border:1px solid #ddd;padding:8px;'>{sh}</td>"
-                )
+                html += f"<td rowspan='{MAX_PER_SHIFT}' class='shift-cell'>{sh}</td>"
             for d in days:
                 cell = ""
                 entries = grid.get(sh, {}).get(d, [])
@@ -433,35 +446,31 @@ if st.session_state.sched_df is not None:
                     if role == "mentor":
                         cell = f"<strong>{name}</strong>"
                     elif role == "mentee":
-                        cell = (
-                            "<span style='background:#add8e6;padding:2px 4px;border-radius:3px'>"
-                            f"{name}</span>"
-                        )
+                        cell = f"<span class='mentee'>{name}</span>"
                     else:
                         cell = name
                     if fb:
                         cell += " *"
-                html += (
-                    f"<td style='border:1px solid #ddd;padding:8px;vertical-align:top;'>{cell}</td>"
-                )
+                html += f"<td>{cell}</td>"
             html += "</tr>"
     html += "</table>"
 
     st.markdown("### Schedule Preview", unsafe_allow_html=True)
     st.markdown(
-        "Mentors are **bold**, mentees highlighted in light blue, and * denotes forced assignments.",
+        "Mentors are **bold**, mentees highlighted, and * denotes forced assignments.",
         unsafe_allow_html=True,
     )
     st.markdown(html, unsafe_allow_html=True)
 
-    # Legend BELOW the preview
+    # Legend BELOW the preview (Forced shown only if present)
     legend = """
     <div style="margin: 12px 0;">
       <span style="display:inline-block;margin-right:16px;"><strong>Mentor</strong></span>
-      <span style="display:inline-block;margin-right:16px;background:#add8e6;padding:2px 6px;border-radius:4px;">Mentee</span>
-      <span style="display:inline-block;margin-right:16px;">* Forced</span>
-    </div>
+      <span style="display:inline-block;margin-right:16px;background:#2a4158;padding:2px 6px;border-radius:4px;">Mentee</span>
     """
+    if has_forced:
+        legend += "<span style='display:inline-block;margin-right:16px;'>* Forced</span>"
+    legend += "</div>"
     st.markdown(legend, unsafe_allow_html=True)
 
     # Preference Breakdown
@@ -485,7 +494,7 @@ if st.session_state.sched_df is not None:
             # Formats
             border = wb.add_format({"border": 1})
             mentor_fmt = wb.add_format({"border": 1, "bold": True})
-            mentee_fmt = wb.add_format({"border": 1, "bg_color": "#ADD8E6"})
+            mentee_fmt = wb.add_format({"border": 1, "bg_color": "#2A4158", "font_color": "#FFFFFF"})
             vol_fmt = wb.add_format({"border": 1})
 
             # Local day/shift lists derived from the current schedule
@@ -533,7 +542,8 @@ if st.session_state.sched_df is not None:
             ws.write(row_idx, 0, "Legend:", border)
             ws.write(row_idx, 1, "Mentor", mentor_fmt)
             ws.write(row_idx, 2, "Mentee", mentee_fmt)
-            ws.write(row_idx, 3, "* Forced", border)
+            if has_forced:
+                ws.write(row_idx, 3, "* Forced", border)
 
             # Preferences & Fallback sheets
             breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
