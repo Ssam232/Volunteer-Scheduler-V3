@@ -35,6 +35,7 @@ def norm_name(s: str) -> str:
 
 # ── File upload ──────────────────────────────────────────────────────────────
 uploader = st.file_uploader("Upload survey XLSX", type="xlsx")
+
 # Reset the app when the file is removed
 if not uploader:
     st.session_state.df_raw = None
@@ -61,10 +62,6 @@ if uploader:
     st.subheader("Group-Together Exceptions")
     st.write("Enter each pair on its own line: First Last, First Last")
     st.write("_Leave blank and run if no exceptions._")
-
-    # Bind the textarea to session state so we can edit it via buttons
-    if "pairs_text" not in st.session_state:
-        st.session_state["pairs_text"] = ""
 
     pairs_input = st.text_area(
         "Pairs (one per line)",
@@ -114,7 +111,7 @@ if uploader:
             parts = [p.strip() for p in line.split(",")]
             new_parts = [rep_map.get(p, p) for p in parts if p]
             new_lines.append(", ".join(new_parts))
-        return "\n".join(new_lines)  # <-- fixed newline
+        return "\n".join(new_lines)
 
     def _replace_one_cb(raw: str, sugg: str):
         text = st.session_state.get("pairs_text", "") or ""
@@ -200,57 +197,44 @@ if uploader:
         for a_raw, b_raw in raw_pairs_run:
             a_can = vol_lookup.get(norm_name(a_raw))
             b_can = vol_lookup.get(norm_name(b_raw))
-
-            # Name not recognized
             if not a_can or not b_can:
                 missing = []
                 if not a_can:
                     missing.append(a_raw)
                 if not b_can:
                     missing.append(b_raw)
-                nice = ", ".join(missing)
                 report_rows.append({
                     "Pair": f"{a_raw} & {b_raw}",
                     "Status": "Skipped",
-                    "Details": f"We couldn't find {nice} in the uploaded list. Use the suggestions above to fix the spelling."
+                    "Reason": f"Name not recognized: {', '.join(missing)}"
                 })
                 continue
-
-            # Look up final placements
             sa = slot_by_name.get(a_can)
             sb = slot_by_name.get(b_can)
-
-            if sa and sb and sa == sb:
+            if sa and sb:
+                if sa == sb:
+                    report_rows.append({
+                        "Pair": f"{a_can} & {b_can}",
+                        "Status": "Grouped ✓",
+                        "Reason": f"Assigned to {sa}"
+                    })
+                else:
+                    report_rows.append({
+                        "Pair": f"{a_can} & {b_can}",
+                        "Status": "Not grouped ✗",
+                        "Reason": f"{a_can} at {sa}, {b_can} at {sb} (check capacity/coverage)"
+                    })
+            else:
+                missing = []
+                if not sa:
+                    missing.append(a_can)
+                if not sb:
+                    missing.append(b_can)
                 report_rows.append({
                     "Pair": f"{a_can} & {b_can}",
-                    "Status": "Grouped ✓",
-                    "Details": f"Scheduled together on **{sa}**."
+                    "Status": "Not in schedule",
+                    "Reason": f"{', '.join(missing)} not placed under constraints"
                 })
-                continue
-
-            if sa and sb and sa != sb:
-                report_rows.append({
-                    "Pair": f"{a_can} & {b_can}",
-                    "Status": "Not grouped ✗",
-                    "Details": (
-                        f"Both were scheduled but on different shifts — **{a_can} → {sa}**, "
-                        f"**{b_can} → {sb}**. Try freeing space or adjusting their preferences."
-                    )
-                })
-                continue
-
-            not_placed = []
-            if not sa:
-                not_placed.append(a_can)
-            if not sb:
-                not_placed.append(b_can)
-            who = f"{not_placed[0]} and {not_placed[1]}" if len(not_placed) == 2 else not_placed[0]
-            report_rows.append({
-                "Pair": f"{a_can} & {b_can}",
-                "Status": "Not in schedule",
-                "Details": f"We couldn't place {who} given availability, capacity, and mentor/mentee rules."
-            })
-
         st.session_state.group_report = pd.DataFrame(report_rows)
 
 # ── Display Results ──────────────────────────────────────────────────────────
