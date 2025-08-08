@@ -9,11 +9,9 @@ st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3", layout="wide")
 st.title("📅 PEMRAP Volunteer Scheduler V3")
 
 # ── Initialize session state ─────────────────────────────────────────────────
-if "df_raw" not in st.session_state:
-    st.session_state.df_raw = None
-for key in ("sched_df", "breakdown_df", "group_report"):
+for key in ("df_raw", "sched_df", "breakdown_df", "group_report", "pairs_text"):
     if key not in st.session_state:
-        st.session_state[key] = None
+        st.session_state[key] = None if key != "pairs_text" else ""
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
@@ -58,19 +56,21 @@ if uploader:
     ui_names = extract_names_for_ui(df_raw)
     vol_lookup = {norm_name(n): n for n in ui_names}
 
-    # ── Group-Together Exceptions UI ─────────────────────────────────────────
+    # ── Group-Together Exceptions UI (with clickable typo fixes) ─────────────
     st.subheader("Group-Together Exceptions")
     st.write("Enter each pair on its own line: First Last, First Last")
     st.write("_Leave blank and run if no exceptions._")
 
     pairs_input = st.text_area(
-        "Pairs (one per line)", placeholder="Alice Smith, Bob Jones", height=100
+        "Pairs (one per line)",
+        key="pairs_text",
+        placeholder="Alice Smith, Bob Jones",
+        height=100,
     ).strip()
 
-    # Parse and validate pairs (case/space-insensitive; suggest fixes but don't block)
     valid_pairs: list[tuple[str, str]] = []
-    typos: list[str] = []
     raw_pairs: list[tuple[str, str]] = []
+    suggestions: list[tuple[str, str | None]] = []  # (raw_name, suggested or None)
 
     if pairs_input:
         for line in pairs_input.splitlines():
@@ -79,29 +79,75 @@ if uploader:
                 continue
             a_raw, b_raw = parts
             raw_pairs.append((a_raw, b_raw))
-            a = vol_lookup.get(norm_name(a_raw))
-            b = vol_lookup.get(norm_name(b_raw))
-            if a and b:
-                valid_pairs.append((a, b))
+
+            def canon_or_suggest(raw: str) -> tuple[str | None, str | None]:
+                canon = vol_lookup.get(norm_name(raw))
+                if canon:
+                    return canon, None
+                keys = list(vol_lookup.keys())
+                match = difflib.get_close_matches(norm_name(raw), keys, n=1, cutoff=0.6)
+                return None, (vol_lookup[match[0]] if match else None)
+
+            a_can, a_sugg = canon_or_suggest(a_raw)
+            b_can, b_sugg = canon_or_suggest(b_raw)
+
+            if a_can and b_can:
+                valid_pairs.append((a_can, b_can))
             else:
-                for raw in (a_raw, b_raw):
-                    if vol_lookup.get(norm_name(raw)) is None:
-                        sugg_key = difflib.get_close_matches(norm_name(raw), list(vol_lookup.keys()), n=1, cutoff=0.6)
-                        typos.append(f"{raw} (did you mean: {vol_lookup[sugg_key[0]]})" if sugg_key else raw)
+                if not a_can:
+                    suggestions.append((a_raw, a_sugg))
+                if not b_can:
+                    suggestions.append((b_raw, b_sugg))
 
-    # Show typos but DO NOT block scheduling
-    err_box = st.empty()
-    if typos:
-        err_box.error(f"Typo detected in group-together names: {typos}")
-    else:
-        err_box.empty()
+    # Render clickable suggestions (non-blocking)
+    if suggestions:
+        st.markdown("**Name fixes:** click to apply")
+        cols = st.columns(2)
+        any_fixable = False
+        for i, (raw, sugg) in enumerate(suggestions):
+            if sugg:
+                any_fixable = True
+                if cols[i % 2].button(f"Replace “{raw}” → “{sugg}”", key=f"fix_{i}"):
+                    text = st.session_state["pairs_text"] or ""
+                    pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
+                    st.session_state["pairs_text"] = re.sub(pattern, sugg, text)
+                    st.rerun()
+            else:
+                cols[i % 2].markdown(f"⚠️ **{raw}** — no close match found")
+        if any_fixable and st.button("Apply all fixes"):
+            text = st.session_state["pairs_text"] or ""
+            for raw, sugg in suggestions:
+                if sugg:
+                    pattern = rf'(?<!\S){re.escape(raw)}(?!\S)'
+                    text = re.sub(pattern, sugg, text)
+            st.session_state["pairs_text"] = text
+            st.rerun()
 
-    # Apply grouping rules to the solver (only the validated pairs)
+    # Apply grouping rules (only validated canonical pairs so far)
     Scheduler2.GROUP_PAIRS = valid_pairs
 
     # ── Run Scheduler ─────────────────────────────────────────────────────────
     if st.button("Run Scheduler"):
+        # Re-parse pairs at run time to capture any last edits
+        pairs_text = (st.session_state.get("pairs_text") or "").strip()
+        valid_pairs_run: list[tuple[str, str]] = []
+        raw_pairs_run: list[tuple[str, str]] = []
+        if pairs_text:
+            for line in pairs_text.splitlines():
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                if len(parts) != 2:
+                    continue
+                a_raw, b_raw = parts
+                raw_pairs_run.append((a_raw, b_raw))
+                a_can = vol_lookup.get(norm_name(a_raw))
+                b_can = vol_lookup.get(norm_name(b_raw))
+                if a_can and b_can:
+                    valid_pairs_run.append((a_can, b_can))
+        Scheduler2.GROUP_PAIRS = valid_pairs_run
+
+        # Solve
         sched_df, _, breakdown_df = build_schedule(df_raw)
+
         # Parse Day/Shift for grid
         if "Time Slot" in sched_df.columns:
             ts = sched_df["Time Slot"].astype(str)
@@ -125,10 +171,9 @@ if uploader:
             .to_dict()
         )
         report_rows = []
-        for a_raw, b_raw in raw_pairs:
+        for a_raw, b_raw in raw_pairs_run:
             a_can = vol_lookup.get(norm_name(a_raw))
             b_can = vol_lookup.get(norm_name(b_raw))
-            pair_label = f"{a_raw} & {b_raw}"
             if not a_can or not b_can:
                 missing = []
                 if not a_can:
@@ -136,7 +181,7 @@ if uploader:
                 if not b_can:
                     missing.append(b_raw)
                 report_rows.append({
-                    "Pair": pair_label,
+                    "Pair": f"{a_raw} & {b_raw}",
                     "Status": "Skipped",
                     "Reason": f"Name not recognized: {', '.join(missing)}"
                 })
@@ -151,8 +196,6 @@ if uploader:
                         "Reason": f"Assigned to {sa}"
                     })
                 else:
-                    # This should not happen if grouping constraints are enforced;
-                    # include anyway in case the user re-runs without applying pairs.
                     report_rows.append({
                         "Pair": f"{a_can} & {b_can}",
                         "Status": "Not grouped ✗",
@@ -166,8 +209,8 @@ if uploader:
                     missing.append(b_can)
                 report_rows.append({
                     "Pair": f"{a_can} & {b_can}",
-                    "Status": "Unassigned",
-                    "Reason": f"{', '.join(missing)} not in schedule (infeasible with constraints)"
+                    "Status": "Not in schedule",
+                    "Reason": f"{', '.join(missing)} not placed under constraints"
                 })
         st.session_state.group_report = pd.DataFrame(report_rows)
 
@@ -236,16 +279,16 @@ if st.session_state.sched_df is not None:
     )
     st.markdown(html, unsafe_allow_html=True)
 
-    # ── Grouping results (success & reasons) ──────────────────────────────────
+    # Grouping results table
     if st.session_state.group_report is not None and not st.session_state.group_report.empty:
         st.subheader("Group-Together Results")
         st.dataframe(st.session_state.group_report, use_container_width=True)
 
-    # ── Preference Breakdown ───────────────────────────────────────────────────
+    # Preference Breakdown
     st.subheader("Preference Breakdown")
     st.dataframe(breakdown_df, use_container_width=True)
 
-    # ── Forced Assignments ────────────────────────────────────────────────────
+    # Forced Assignments
     st.subheader("Forced Assignments")
     fb = sched_df[sched_df["Fallback"]]
     if not fb.empty:
@@ -305,9 +348,8 @@ if st.session_state.sched_df is not None:
             ws.set_column(0, 0, 16)
             ws.set_column(1, len(days_local), 22)
 
-            # Preferences sheet
+            # Preferences & Fallback sheets
             breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
-            # Fallback sheet
             fb_df = sched_df[sched_df["Fallback"]][["Time Slot","Name","Role"]]
             fb_df.to_excel(writer, sheet_name="Fallback", index=False)
         return buf.getvalue()
@@ -319,4 +361,4 @@ if st.session_state.sched_df is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# Note: Refresh (F5) to reset
+# Note: Clear the upload to reset the app
