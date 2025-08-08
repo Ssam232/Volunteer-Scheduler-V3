@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import io, re, difflib
 import Scheduler2  # scheduling core module
-from Scheduler2 import build_schedule, MAX_PER_SHIFT
+from Scheduler2 import build_schedule, MAX_PER_SHIFT, load_preferences
 
 # ── Page configuration ──────────────────────────────────────────────────────
 st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3", layout="wide")
@@ -92,6 +92,66 @@ def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
         new_lines.append(", ".join(new_parts))
     return "\n".join(new_lines)
 
+# ---- WHAT-IF EXPLAINER (Option 3) ------------------------------------------
+def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw: pd.DataFrame) -> str:
+    """
+    Heuristic post-solve explainer:
+    - If no shared availability → say so.
+    - Else check each shared slot for capacity/mentor coverage feasibility w.r.t. current schedule.
+    - If some slot looks feasible, say it would worsen objective (more forced assignments / lower prefs).
+    """
+    try:
+        volunteers, roles, shifts, weights, prefs_map = load_preferences(df_raw)
+    except Exception:
+        # If parsing prefs fails, keep it simple
+        return "Could not analyze availability details from the survey."
+
+    prefs_a = set(prefs_map.get(a_can, []))
+    prefs_b = set(prefs_map.get(b_can, []))
+    shared = [s for s in shifts if s in prefs_a and s in prefs_b]
+    if not shared:
+        return "They don't share any common availability in the survey."
+
+    # Build current slot->[(name, role, fb)]
+    by_slot: dict[str, list[tuple[str, str, bool]]] = {}
+    for _, r in sched_df.iterrows():
+        slot = str(r["Time Slot"])
+        by_slot.setdefault(slot, []).append((r["Name"], str(r.get("Role", "")), bool(r["Fallback"])))
+
+    capacity_block, mentor_block = True, True
+    for s in shared:
+        entries = by_slot.get(s, [])
+        # capacity needed: 2 minus number already there among the pair
+        already = sum(1 for n,_,_ in entries if n in (a_can, b_can))
+        needed = 2 - already
+        if len(entries) + max(0, needed) > MAX_PER_SHIFT:
+            # capacity block on this slot
+            continue
+        capacity_block = False
+        # mentor coverage if mentee present
+        roles_here = [rl for _, rl, _ in entries]
+        # after adding them:
+        roles_aug = roles_here + [roles.get(a_can, ""), roles.get(b_can, "")]
+        any_mentee = any(r == "mentee" for r in roles_aug)
+        any_mentor = any(r == "mentor" for r in roles_aug)
+        if any_mentee and not any_mentor:
+            # mentor rule would be broken here
+            continue
+        mentor_block = False
+        # This slot looks feasible under rules → solver likely avoided it due to objective trade-offs
+        return (f"Could only group them by placing both on **{s}** without breaking rules, "
+                f"but that would worsen the objective (more forced assignments / fewer first choices).")
+
+    if capacity_block and mentor_block:
+        return ("All shared slots were at capacity and would also violate mentor coverage "
+                "(adding a mentee without a mentor).")
+    if capacity_block:
+        return "All shared slots were full (3 of 3)."
+    if mentor_block:
+        return "Shared slots would break mentor coverage (mentee present without a mentor)."
+    # Fallback generic
+    return "Grouping would worsen the objective under current constraints."
+
 def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     """Run the solver using current pairs_text and store results in session_state."""
     # Parse pairs for this run
@@ -126,7 +186,7 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     st.session_state.sched_df = sched_df
     st.session_state.breakdown_df = breakdown_df
 
-    # Build group report (with forced indication)
+    # Build group report (with forced indication + what-if)
     placed_by_key, forced_by_key = build_placement_maps(sched_df)
     report_rows = []
     for a_raw, b_raw in raw_pairs_run:
@@ -163,27 +223,68 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
             continue
 
         if sa and sb and sa != sb:
+            reason = explain_non_grouping(a_can, b_can, sched_df, df_raw)
             report_rows.append({
                 "Pair": f"{a_can} & {b_can}",
                 "Status": "Not grouped ✗",
-                "Details": (
-                    f"Both were scheduled but on different shifts — **{a_can} → {sa}**, "
-                    f"**{b_can} → {sb}**. Try freeing space or adjusting their preferences."
-                )
+                "Details": reason
             })
             continue
 
+        # Not placed
         not_placed = []
         if not sa: not_placed.append(a_can)
         if not sb: not_placed.append(b_can)
         who = f"{not_placed[0]} and {not_placed[1]}" if len(not_placed) == 2 else not_placed[0]
+        reason = explain_non_grouping(a_can, b_can, sched_df, df_raw)
         report_rows.append({
             "Pair": f"{a_can} & {b_can}",
             "Status": "Not in schedule",
-            "Details": f"We couldn't place {who} given availability, capacity, and mentor/mentee rules."
+            "Details": reason if reason else f"We couldn't place {who} given availability, capacity, and mentor/mentee rules."
         })
 
     st.session_state.group_report = pd.DataFrame(report_rows)
+
+# ── Data hygiene (Option 9) ──────────────────────────────────────────────────
+def validate_names(df_raw: pd.DataFrame):
+    """Warn if two rows normalize to the same name."""
+    cols = {c.lower(): c for c in df_raw.columns}
+    first = next((cols[k] for k in cols if "first" in k and "name" in k), None)
+    last  = next((cols[k] for k in cols if "last"  in k and "name" in k), None)
+    if first and last:
+        series = (df_raw[first].astype(str).str.strip() + " " + df_raw[last].astype(str).str.strip())
+    elif "name" in cols:
+        series = df_raw[cols["name"]].astype(str).str.strip()
+    else:
+        series = (df_raw.iloc[:,0].astype(str).str.strip() + " " + df_raw.iloc[:,1].astype(str).str.strip())
+
+    key_to_names = {}
+    for raw in series.dropna().tolist():
+        key = norm_name(raw)
+        key_to_names.setdefault(key, set()).add(raw)
+
+    collisions = {k: sorted(v) for k, v in key_to_names.items() if len(v) > 1}
+    if collisions:
+        st.warning("⚠️ Some names normalize to the same person (possible duplicates): " +
+                   "; ".join([", ".join(v) for v in collisions.values()]))
+
+def validate_preference_strings(df_raw: pd.DataFrame):
+    """Warn on malformed preference/availability strings."""
+    pref_cols = [c for c in df_raw.columns if str(c).lower().startswith(("pref","availability"))]
+    if not pref_cols:
+        return
+    values = []
+    for c in pref_cols:
+        values += [str(v) for v in df_raw[c].dropna().tolist()]
+    values = list({re.sub(r"\s+", " ", v).strip() for v in values})
+    # normalize dashes
+    values = [re.sub(r"[–—−]", "-", v) for v in values]
+    pat = re.compile(r"^[A-Za-z]+ \d{1,2}:\d{2}-\d{1,2}:\d{2}$")
+    bad = [v for v in values if not pat.match(v)]
+    if bad:
+        sample = ", ".join(bad[:8]) + ("…" if len(bad) > 8 else "")
+        st.warning("⚠️ Some availability strings look off (expect 'Day HH:MM-HH:MM'). "
+                   f"Examples: {sample}")
 
 # ── File upload ──────────────────────────────────────────────────────────────
 uploader = st.file_uploader("Upload survey XLSX", type="xlsx")
@@ -206,6 +307,10 @@ if uploader:
             st.error(f"Failed to read Excel: {e}")
             st.stop()
     df_raw = st.session_state.df_raw
+
+    # Data hygiene checks (show once per upload)
+    validate_names(df_raw)
+    validate_preference_strings(df_raw)
 
     # Build volunteer list for grouping UI (robust to column variations)
     ui_names = extract_names_for_ui(df_raw)
@@ -313,6 +418,16 @@ if st.session_state.sched_df is not None:
         st.subheader("Group-Together Results")
         styled = style_group_report(st.session_state.group_report)
         st.table(styled)
+
+    # ── Legend (UI polish option 3) ───────────────────────────────────────────
+    legend = """
+    <div style="margin: 12px 0;">
+      <span style="display:inline-block;margin-right:16px;"><strong>Mentor</strong></span>
+      <span style="display:inline-block;margin-right:16px;background:#add8e6;padding:2px 6px;border-radius:4px;">Mentee</span>
+      <span style="display:inline-block;margin-right:16px;">* Forced</span>
+    </div>
+    """
+    st.markdown(legend, unsafe_allow_html=True)
 
     # ── HTML Grid ──────────────────────────────────────────────────────────────
     html = "<table style='border-collapse: collapse; width:100%;'>"
