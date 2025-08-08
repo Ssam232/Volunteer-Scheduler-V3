@@ -39,7 +39,7 @@ def norm_name(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip()).lower()
 
 def style_group_report(df: pd.DataFrame):
-    """Darker row colors for dark backgrounds."""
+    """Darker row colors for dark backgrounds (kept)."""
     def _row_style(row):
         status = str(row.get("Status", ""))
         if "Grouped ✓" in status:
@@ -129,8 +129,7 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
 
         # mentor coverage if any mentee present
         roles_here = [rl for _, rl, _ in entries]
-        # Get roles map from load_preferences result
-        roles_map = {v: roles[v] for v in roles}
+        roles_map = roles  # from load_preferences
         roles_aug = roles_here + [roles_map.get(a_can, ""), roles_map.get(b_can, "")]
         any_mentee = any(r == "mentee" for r in roles_aug)
         any_mentor = any(r == "mentor" for r in roles_aug)
@@ -419,25 +418,19 @@ if st.session_state.sched_df is not None:
         styled = style_group_report(st.session_state.group_report)
         st.table(styled)
 
-    # ── Dark-mode CSS + HTML Grid ─────────────────────────────────────────────
-    table_css = """
-    <style>
-      .schedule-table { border-collapse: collapse; width: 100%; color: #e8eaed; }
-      .schedule-table th, .schedule-table td { border: 1px solid #444; padding: 8px; }
-      .schedule-table th { background: #1f2933; }
-      .schedule-table .shift-cell { background: #111827; font-weight: 600; }
-      .schedule-table .mentee { background: #2a4158; padding: 2px 6px; border-radius: 4px; display: inline-block; }
-    </style>
-    """
-    st.markdown(table_css, unsafe_allow_html=True)
-
-    html = "<table class='schedule-table'>"
-    html += "<tr><th></th>" + "".join(f"<th>{d}</th>" for d in days) + "</tr>"
+    # ── HTML Grid (light theme) ───────────────────────────────────────────────
+    html = "<table style='border-collapse: collapse; width:100%;'>"
+    html += "<tr><th style='border:1px solid #ddd; padding:8px;'></th>" + \
+            "".join(f"<th style='border:1px solid #ddd; padding:8px;'>{d}</th>" for d in days) + \
+            "</tr>"
     for sh in shifts:
         for i in range(MAX_PER_SHIFT):
             html += "<tr>"
             if i == 0:
-                html += f"<td rowspan='{MAX_PER_SHIFT}' class='shift-cell'>{sh}</td>"
+                html += (
+                    f"<td rowspan='{MAX_PER_SHIFT}' style='border:1px solid #ddd; "
+                    f"padding:8px; vertical-align:middle;'>{sh}</td>"
+                )
             for d in days:
                 cell = ""
                 entries = grid.get(sh, {}).get(d, [])
@@ -446,28 +439,32 @@ if st.session_state.sched_df is not None:
                     if role == "mentor":
                         cell = f"<strong>{name}</strong>"
                     elif role == "mentee":
-                        cell = f"<span class='mentee'>{name}</span>"
+                        cell = ("<span style='background:#ADD8E6; padding:2px 4px; "
+                                "border-radius:3px'>" + f"{name}</span>")
                     else:
                         cell = name
                     if fb:
                         cell += " *"
-                html += f"<td>{cell}</td>"
+                html += (
+                    f"<td style='border:1px solid #ddd; padding:8px; vertical-align:top;'>{cell}</td>"
+                )
             html += "</tr>"
     html += "</table>"
 
     st.markdown("### Schedule Preview", unsafe_allow_html=True)
     st.markdown(
-        "Mentors are **bold**, mentees highlighted, and * denotes forced assignments.",
+        "Mentors are **bold**, mentees highlighted in light blue, and * denotes forced assignments.",
         unsafe_allow_html=True,
     )
     st.markdown(html, unsafe_allow_html=True)
 
     # Legend BELOW the preview (Forced shown only if present)
-    legend = """
-    <div style="margin: 12px 0;">
-      <span style="display:inline-block;margin-right:16px;"><strong>Mentor</strong></span>
-      <span style="display:inline-block;margin-right:16px;background:#2a4158;padding:2px 6px;border-radius:4px;">Mentee</span>
-    """
+    legend = (
+        "<div style='margin: 12px 0;'>"
+        "<span style='display:inline-block;margin-right:16px;'><strong>Mentor</strong></span>"
+        "<span style='display:inline-block;margin-right:16px;background:#ADD8E6;"
+        "padding:2px 6px;border-radius:4px;'>Mentee</span>"
+    )
     if has_forced:
         legend += "<span style='display:inline-block;margin-right:16px;'>* Forced</span>"
     legend += "</div>"
@@ -486,7 +483,7 @@ if st.session_state.sched_df is not None:
     else:
         st.write("_None_")
 
-    # ── Excel export with formatted grid ───────────────────────────────────────
+    # ── Excel export with formatted grid (light theme) ────────────────────────
     def to_excel_bytes():
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -494,11 +491,12 @@ if st.session_state.sched_df is not None:
             # Formats
             border = wb.add_format({"border": 1})
             mentor_fmt = wb.add_format({"border": 1, "bold": True})
-            mentee_fmt = wb.add_format({"border": 1, "bg_color": "#2A4158", "font_color": "#FFFFFF"})
+            mentee_fmt = wb.add_format({"border": 1, "bg_color": "#ADD8E6"})
             vol_fmt = wb.add_format({"border": 1})
 
             # Local day/shift lists derived from the current schedule
-            days_local = [d for d in ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"] if d in sched_df["Day"].unique()]
+            days_local = [d for d in ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+                          if d in sched_df["Day"].unique()]
             raw_shifts_local = [str(s).strip() for s in sched_df["Shift"].dropna().unique()]
             def _key(s):
                 try:
