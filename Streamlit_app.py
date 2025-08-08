@@ -9,15 +9,20 @@ st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3", layout="wide")
 st.title("📅 PEMRAP Volunteer Scheduler V3")
 
 # ── Initialize session state ─────────────────────────────────────────────────
-for key in ("df_raw", "sched_df", "breakdown_df", "group_report", "pairs_text"):
+for key, default in (
+    ("df_raw", None),
+    ("sched_df", None),
+    ("breakdown_df", None),
+    ("group_report", None),
+    ("pairs_text", ""),
+    ("trigger_run", False),
+):
     if key not in st.session_state:
-        st.session_state[key] = None if key != "pairs_text" else ""
+        st.session_state[key] = default
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
-    """Build a clean Name list for the Group UI from the raw sheet.
-    Tries First/Last -> Name -> first two columns. Case/space insensitive.
-    """
+    """Build a clean Name list for the Group UI from the raw sheet."""
     cols = {c.lower(): c for c in df.columns}
     first = next((cols[k] for k in cols if "first" in k and "name" in k), None)
     last  = next((cols[k] for k in cols if "last"  in k and "name" in k), None)
@@ -34,22 +39,138 @@ def norm_name(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip()).lower()
 
 def style_group_report(df: pd.DataFrame):
-    """Return a pandas Styler with colored rows based on Status."""
+    """Darker row colors for dark backgrounds."""
     def _row_style(row):
         status = str(row.get("Status", ""))
         if "Grouped ✓" in status:
-            bg, fg = "#e8f5e9", "#1b5e20"   # green
+            bg, fg = "#0f3d1e", "#b9f6ca"   # dark green bg, mint text
         elif "Not grouped" in status or "Not in schedule" in status:
-            bg, fg = "#ffebee", "#b71c1c"   # red
+            bg, fg = "#3d0f12", "#ff8a80"   # dark red bg, soft red text
         elif "Skipped" in status:
-            bg, fg = "#fff8e1", "#5d4037"   # amber
+            bg, fg = "#3d2a00", "#ffd54f"   # dark amber bg, amber text
         else:
-            bg, fg = "#f5f5f5", "#424242"   # neutral
+            bg, fg = "#263238", "#eceff1"   # slate bg, light text
         return [f"background-color: {bg}; color: {fg};"] * len(row)
 
-    styler = df.style.apply(_row_style, axis=1)
-    styler = styler.set_properties(**{"white-space": "nowrap"})
+    styler = df.style.apply(_row_style, axis=1).set_properties(**{"white-space": "nowrap"})
     return styler
+
+def build_placement_lookup(sched_df: pd.DataFrame):
+    tmp = sched_df.copy()
+    if "Day" not in tmp.columns or "Shift" not in tmp.columns:
+        ts_tmp = tmp["Time Slot"].astype(str)
+        parts_tmp = ts_tmp.str.split(r"\s+", n=1, expand=True)
+        tmp["Day"] = parts_tmp[0].str.strip().str.title()
+        tmp["Shift"] = parts_tmp[1].str.replace(r"[–—−]", "-", regex=True).str.strip()
+    tmp["_key"] = tmp["Name"].map(norm_name)
+    placed = {}
+    for _, r in tmp.iterrows():
+        key = r["_key"]
+        day = str(r.get("Day", "")).strip()
+        shf = str(r.get("Shift", "")).strip()
+        ts_label = str(r.get("Time Slot", "")).strip()
+        label = f"{day} {shf}".strip() if (day and shf) else ts_label
+        if key not in placed:
+            placed[key] = label
+    return placed
+
+def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
+    """Replace exact tokens between commas across lines."""
+    lines = (text or "").splitlines()
+    rep_map = {raw: sugg for raw, sugg in replacements if sugg}
+    new_lines = []
+    for line in lines:
+        parts = [p.strip() for p in line.split(",")]
+        new_parts = [rep_map.get(p, p) for p in parts if p]
+        new_lines.append(", ".join(new_parts))
+    return "\n".join(new_lines)
+
+def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
+    """Run the solver using current pairs_text and store results in session_state."""
+    # Parse pairs for this run
+    pairs_text = (st.session_state.get("pairs_text") or "").strip()
+    valid_pairs_run, raw_pairs_run = [], []
+    if pairs_text:
+        for line in pairs_text.splitlines():
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+            if len(parts) != 2:
+                continue
+            a_raw, b_raw = parts
+            raw_pairs_run.append((a_raw, b_raw))
+            a_can = vol_lookup.get(norm_name(a_raw))
+            b_can = vol_lookup.get(norm_name(b_raw))
+            if a_can and b_can:
+                valid_pairs_run.append((a_can, b_can))
+
+    # Apply and solve
+    Scheduler2.GROUP_PAIRS = valid_pairs_run
+    sched_df, _, breakdown_df = build_schedule(df_raw)
+
+    # Parse Day/Shift for grid
+    if "Time Slot" in sched_df.columns:
+        ts = sched_df["Time Slot"].astype(str)
+        parts = ts.str.split(r"\s+", n=1, expand=True)
+        sched_df["Day"] = parts[0].str.strip().str.title().fillna("")
+        sched_df["Shift"] = parts[1].str.replace(r"[–—−]", "-", regex=True).str.strip().fillna("")
+    else:
+        sched_df["Day"], sched_df["Shift"] = "", ""
+
+    # Save schedule + breakdown
+    st.session_state.sched_df = sched_df
+    st.session_state.breakdown_df = breakdown_df
+
+    # Build group report
+    placed_by_key = build_placement_lookup(sched_df)
+    report_rows = []
+    for a_raw, b_raw in raw_pairs_run:
+        a_can = vol_lookup.get(norm_name(a_raw))
+        b_can = vol_lookup.get(norm_name(b_raw))
+
+        if not a_can or not b_can:
+            missing = []
+            if not a_can: missing.append(a_raw)
+            if not b_can: missing.append(b_raw)
+            nice = ", ".join(missing)
+            report_rows.append({
+                "Pair": f"{a_raw} & {b_raw}",
+                "Status": "Skipped",
+                "Details": f"We couldn't find {nice} in the uploaded list. Use the suggestions above to fix the spelling."
+            })
+            continue
+
+        sa = placed_by_key.get(norm_name(a_can))
+        sb = placed_by_key.get(norm_name(b_can))
+
+        if sa and sb and sa == sb:
+            report_rows.append({
+                "Pair": f"{a_can} & {b_can}",
+                "Status": "Grouped ✓",
+                "Details": f"Scheduled together on **{sa}**."
+            })
+            continue
+
+        if sa and sb and sa != sb:
+            report_rows.append({
+                "Pair": f"{a_can} & {b_can}",
+                "Status": "Not grouped ✗",
+                "Details": (
+                    f"Both were scheduled but on different shifts — **{a_can} → {sa}**, "
+                    f"**{b_can} → {sb}**. Try freeing space or adjusting their preferences."
+                )
+            })
+            continue
+
+        not_placed = []
+        if not sa: not_placed.append(a_can)
+        if not sb: not_placed.append(b_can)
+        who = f"{not_placed[0]} and {not_placed[1]}" if len(not_placed) == 2 else not_placed[0]
+        report_rows.append({
+            "Pair": f"{a_can} & {b_can}",
+            "Status": "Not in schedule",
+            "Details": f"We couldn't place {who} given availability, capacity, and mentor/mentee rules."
+        })
+
+    st.session_state.group_report = pd.DataFrame(report_rows)
 
 # ── File upload ──────────────────────────────────────────────────────────────
 uploader = st.file_uploader("Upload survey XLSX", type="xlsx")
@@ -61,6 +182,7 @@ if not uploader:
     st.session_state.breakdown_df = None
     st.session_state.group_report = None
     st.session_state.pairs_text = ""
+    st.session_state.trigger_run = False
 
 if uploader:
     # Cache raw DataFrame
@@ -81,10 +203,6 @@ if uploader:
     st.write("Enter each pair on its own line: First Last, First Last")
     st.write("_Leave blank and run if no exceptions._")
 
-    # Bind the textarea to session state so we can edit it via buttons
-    if "pairs_text" not in st.session_state:
-        st.session_state["pairs_text"] = ""
-
     pairs_input = st.text_area(
         "Pairs (one per line)",
         key="pairs_text",
@@ -92,8 +210,7 @@ if uploader:
         height=100,
     ).strip()
 
-    valid_pairs: list[tuple[str, str]] = []
-    raw_pairs: list[tuple[str, str]] = []
+    valid_pairs_preview: list[tuple[str, str]] = []
     suggestions: list[tuple[str, str | None]] = []  # (raw_name, suggested or None)
 
     if pairs_input:
@@ -102,7 +219,6 @@ if uploader:
             if len(parts) != 2:
                 continue
             a_raw, b_raw = parts
-            raw_pairs.append((a_raw, b_raw))
 
             def canon_or_suggest(raw: str) -> tuple[str | None, str | None]:
                 canon = vol_lookup.get(norm_name(raw))
@@ -114,175 +230,51 @@ if uploader:
 
             a_can, a_sugg = canon_or_suggest(a_raw)
             b_can, b_sugg = canon_or_suggest(b_raw)
-
             if a_can and b_can:
-                valid_pairs.append((a_can, b_can))
+                valid_pairs_preview.append((a_can, b_can))
             else:
                 if not a_can:
                     suggestions.append((a_raw, a_sugg))
                 if not b_can:
                     suggestions.append((b_raw, b_sugg))
 
-    # Render clickable suggestions (non-blocking) using callbacks
-    def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
-        # Parse pairs text line-by-line, replace exact tokens between commas
-        lines = (text or "").splitlines()
-        rep_map = {raw: sugg for raw, sugg in replacements if sugg}
-        new_lines = []
-        for line in lines:
-            parts = [p.strip() for p in line.split(",")]
-            new_parts = [rep_map.get(p, p) for p in parts if p]
-            new_lines.append(", ".join(new_parts))
-        return "\n".join(new_lines)
-
-    def _replace_one_cb(raw: str, sugg: str):
+    # Clickable suggestions — and auto-run after each fix
+    def _apply_and_rerun(replacements: list[tuple[str, str]]):
         text = st.session_state.get("pairs_text", "") or ""
-        st.session_state["pairs_text"] = _replace_tokens(text, [(raw, sugg)])
-        st.rerun()
-
-    def _replace_all_cb(suggs: list[tuple[str, str | None]]):
-        text = st.session_state.get("pairs_text", "") or ""
-        repl = [(raw, sugg) for raw, sugg in suggs if sugg]
-        st.session_state["pairs_text"] = _replace_tokens(text, repl)
+        st.session_state["pairs_text"] = _replace_tokens(text, replacements)
+        st.session_state["trigger_run"] = True
         st.rerun()
 
     if suggestions:
         st.markdown("**Name fixes:** click to apply")
         cols = st.columns(2)
-        any_fixable = any(s for _, s in suggestions)
+        fixable = [(raw, sugg) for (raw, sugg) in suggestions if sugg]
         for i, (raw, sugg) in enumerate(suggestions):
             if sugg:
                 cols[i % 2].button(
-                    f'Replace "{raw}" -> "{sugg}"',
+                    f'Replace "{raw}" → "{sugg}"',
                     key=f"fix_{i}",
-                    on_click=_replace_one_cb,
-                    args=(raw, sugg),
+                    on_click=_apply_and_rerun,
+                    args=([(raw, sugg)],),
                 )
             else:
                 cols[i % 2].markdown(f"⚠️ **{raw}** — no close match found")
-        if any_fixable:
+        if fixable:
             st.button(
                 "Apply all fixes",
                 key="apply_all_fixes",
-                on_click=_replace_all_cb,
-                args=(suggestions,),
+                on_click=_apply_and_rerun,
+                args=(fixable,),
             )
 
-    # Apply grouping rules (only validated canonical pairs so far)
-    Scheduler2.GROUP_PAIRS = valid_pairs
-
-    # ── Run Scheduler ─────────────────────────────────────────────────────────
+    # Manual run button
     if st.button("Run Scheduler"):
-        # Re-parse pairs at run time to capture any last edits
-        pairs_text = (st.session_state.get("pairs_text") or "").strip()
-        valid_pairs_run: list[tuple[str, str]] = []
-        raw_pairs_run: list[tuple[str, str]] = []
-        if pairs_text:
-            for line in pairs_text.splitlines():
-                parts = [p.strip() for p in line.split(",") if p.strip()]
-                if len(parts) != 2:
-                    continue
-                a_raw, b_raw = parts
-                raw_pairs_run.append((a_raw, b_raw))
-                a_can = vol_lookup.get(norm_name(a_raw))
-                b_can = vol_lookup.get(norm_name(b_raw))
-                if a_can and b_can:
-                    valid_pairs_run.append((a_can, b_can))
-        Scheduler2.GROUP_PAIRS = valid_pairs_run
+        run_scheduler(df_raw, vol_lookup)
 
-        # Solve
-        sched_df, _, breakdown_df = build_schedule(df_raw)
-
-        # Parse Day/Shift for grid
-        if "Time Slot" in sched_df.columns:
-            ts = sched_df["Time Slot"].astype(str)
-            parts = ts.str.split(r"\s+", n=1, expand=True)
-            sched_df["Day"] = parts[0].str.strip().str.title().fillna("")
-            sched_df["Shift"] = (
-                parts[1].str.replace(r"[–—−]", "-", regex=True).str.strip().fillna("")
-            )
-        else:
-            sched_df["Day"], sched_df["Shift"] = "", ""
-
-        # Save to session state
-        st.session_state.sched_df = sched_df
-        st.session_state.breakdown_df = breakdown_df
-
-        # --- Build a robust placement lookup keyed by normalized name ---
-        def placement_lookup(df: pd.DataFrame):
-            tmp = df.copy()
-            if "Day" not in tmp.columns or "Shift" not in tmp.columns:
-                ts_tmp = tmp["Time Slot"].astype(str)
-                parts_tmp = ts_tmp.str.split(r"\s+", n=1, expand=True)
-                tmp["Day"] = parts_tmp[0].str.strip().str.title()
-                tmp["Shift"] = parts_tmp[1].str.replace(r"[–—−]", "-", regex=True).str.strip()
-            tmp["_key"] = tmp["Name"].map(norm_name)
-            placed = {}
-            for _, r in tmp.iterrows():
-                key = r["_key"]
-                day = str(r.get("Day", "")).strip()
-                shf = str(r.get("Shift", "")).strip()
-                ts_label = str(r.get("Time Slot", "")).strip()
-                label = f"{day} {shf}".strip() if (day and shf) else ts_label
-                if key not in placed:
-                    placed[key] = label
-            return placed
-
-        placed_by_key = placement_lookup(sched_df)
-
-        # Grouping results
-        report_rows = []
-        for a_raw, b_raw in raw_pairs_run:
-            a_can = vol_lookup.get(norm_name(a_raw))
-            b_can = vol_lookup.get(norm_name(b_raw))
-
-            # Name not recognized in the upload
-            if not a_can or not b_can:
-                missing = []
-                if not a_can: missing.append(a_raw)
-                if not b_can: missing.append(b_raw)
-                nice = ", ".join(missing)
-                report_rows.append({
-                    "Pair": f"{a_raw} & {b_raw}",
-                    "Status": "Skipped",
-                    "Details": f"We couldn't find {nice} in the uploaded list. Use the suggestions above to fix the spelling."
-                })
-                continue
-
-            # Look up normalized placements from the schedule
-            sa = placed_by_key.get(norm_name(a_can))
-            sb = placed_by_key.get(norm_name(b_can))
-
-            if sa and sb and sa == sb:
-                report_rows.append({
-                    "Pair": f"{a_can} & {b_can}",
-                    "Status": "Grouped ✓",
-                    "Details": f"Scheduled together on **{sa}**."
-                })
-                continue
-
-            if sa and sb and sa != sb:
-                report_rows.append({
-                    "Pair": f"{a_can} & {b_can}",
-                    "Status": "Not grouped ✗",
-                    "Details": (
-                        f"Both were scheduled but on different shifts — **{a_can} → {sa}**, "
-                        f"**{b_can} → {sb}**. Try freeing space or adjusting their preferences."
-                    )
-                })
-                continue
-
-            not_placed = []
-            if not sa: not_placed.append(a_can)
-            if not sb: not_placed.append(b_can)
-            who = f"{not_placed[0]} and {not_placed[1]}" if len(not_placed) == 2 else not_placed[0]
-            report_rows.append({
-                "Pair": f"{a_can} & {b_can}",
-                "Status": "Not in schedule",
-                "Details": f"We couldn't place {who} given availability, capacity, and mentor/mentee rules."
-            })
-
-        st.session_state.group_report = pd.DataFrame(report_rows)
+    # Auto-run if a fix was applied
+    if st.session_state.trigger_run:
+        st.session_state.trigger_run = False
+        run_scheduler(df_raw, vol_lookup)
 
 # ── Display Results ──────────────────────────────────────────────────────────
 if st.session_state.sched_df is not None:
@@ -310,7 +302,7 @@ if st.session_state.sched_df is not None:
         if sh in grid and d in grid[sh]:
             grid[sh][d].append((row["Name"], row.get("Role", ""), bool(row["Fallback"])))
 
-    # Grouping results table (before schedule preview)
+    # Grouping results (colorized) before schedule preview
     if st.session_state.group_report is not None and not st.session_state.group_report.empty:
         st.subheader("Group-Together Results")
         styled = style_group_report(st.session_state.group_report)
@@ -431,5 +423,3 @@ if st.session_state.sched_df is not None:
         file_name="schedule.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-# Note: Clear the upload to reset the app
