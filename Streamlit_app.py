@@ -33,6 +33,24 @@ def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
 def norm_name(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip()).lower()
 
+def style_group_report(df: pd.DataFrame):
+    """Return a pandas Styler with colored rows based on Status."""
+    def _row_style(row):
+        status = str(row.get("Status", ""))
+        if "Grouped ✓" in status:
+            bg, fg = "#e8f5e9", "#1b5e20"   # green
+        elif "Not grouped" in status or "Not in schedule" in status:
+            bg, fg = "#ffebee", "#b71c1c"   # red
+        elif "Skipped" in status:
+            bg, fg = "#fff8e1", "#5d4037"   # amber
+        else:
+            bg, fg = "#f5f5f5", "#424242"   # neutral
+        return [f"background-color: {bg}; color: {fg};"] * len(row)
+
+    styler = df.style.apply(_row_style, axis=1)
+    styler = styler.set_properties(**{"white-space": "nowrap"})
+    return styler
+
 # ── File upload ──────────────────────────────────────────────────────────────
 uploader = st.file_uploader("Upload survey XLSX", type="xlsx")
 
@@ -62,6 +80,10 @@ if uploader:
     st.subheader("Group-Together Exceptions")
     st.write("Enter each pair on its own line: First Last, First Last")
     st.write("_Leave blank and run if no exceptions._")
+
+    # Bind the textarea to session state so we can edit it via buttons
+    if "pairs_text" not in st.session_state:
+        st.session_state["pairs_text"] = ""
 
     pairs_input = st.text_area(
         "Pairs (one per line)",
@@ -186,55 +208,80 @@ if uploader:
         st.session_state.sched_df = sched_df
         st.session_state.breakdown_df = breakdown_df
 
-        # Build a grouping-results report for the pairs the user typed
-        slot_by_name = (
-            sched_df[["Name", "Time Slot"]]
-            .dropna()
-            .groupby("Name")["Time Slot"].first()
-            .to_dict()
-        )
+        # --- Build a robust placement lookup keyed by normalized name ---
+        def placement_lookup(df: pd.DataFrame):
+            tmp = df.copy()
+            if "Day" not in tmp.columns or "Shift" not in tmp.columns:
+                ts_tmp = tmp["Time Slot"].astype(str)
+                parts_tmp = ts_tmp.str.split(r"\s+", n=1, expand=True)
+                tmp["Day"] = parts_tmp[0].str.strip().str.title()
+                tmp["Shift"] = parts_tmp[1].str.replace(r"[–—−]", "-", regex=True).str.strip()
+            tmp["_key"] = tmp["Name"].map(norm_name)
+            placed = {}
+            for _, r in tmp.iterrows():
+                key = r["_key"]
+                day = str(r.get("Day", "")).strip()
+                shf = str(r.get("Shift", "")).strip()
+                ts_label = str(r.get("Time Slot", "")).strip()
+                label = f"{day} {shf}".strip() if (day and shf) else ts_label
+                if key not in placed:
+                    placed[key] = label
+            return placed
+
+        placed_by_key = placement_lookup(sched_df)
+
+        # Grouping results
         report_rows = []
         for a_raw, b_raw in raw_pairs_run:
             a_can = vol_lookup.get(norm_name(a_raw))
             b_can = vol_lookup.get(norm_name(b_raw))
+
+            # Name not recognized in the upload
             if not a_can or not b_can:
                 missing = []
-                if not a_can:
-                    missing.append(a_raw)
-                if not b_can:
-                    missing.append(b_raw)
+                if not a_can: missing.append(a_raw)
+                if not b_can: missing.append(b_raw)
+                nice = ", ".join(missing)
                 report_rows.append({
                     "Pair": f"{a_raw} & {b_raw}",
                     "Status": "Skipped",
-                    "Reason": f"Name not recognized: {', '.join(missing)}"
+                    "Details": f"We couldn't find {nice} in the uploaded list. Use the suggestions above to fix the spelling."
                 })
                 continue
-            sa = slot_by_name.get(a_can)
-            sb = slot_by_name.get(b_can)
-            if sa and sb:
-                if sa == sb:
-                    report_rows.append({
-                        "Pair": f"{a_can} & {b_can}",
-                        "Status": "Grouped ✓",
-                        "Reason": f"Assigned to {sa}"
-                    })
-                else:
-                    report_rows.append({
-                        "Pair": f"{a_can} & {b_can}",
-                        "Status": "Not grouped ✗",
-                        "Reason": f"{a_can} at {sa}, {b_can} at {sb} (check capacity/coverage)"
-                    })
-            else:
-                missing = []
-                if not sa:
-                    missing.append(a_can)
-                if not sb:
-                    missing.append(b_can)
+
+            # Look up normalized placements from the schedule
+            sa = placed_by_key.get(norm_name(a_can))
+            sb = placed_by_key.get(norm_name(b_can))
+
+            if sa and sb and sa == sb:
                 report_rows.append({
                     "Pair": f"{a_can} & {b_can}",
-                    "Status": "Not in schedule",
-                    "Reason": f"{', '.join(missing)} not placed under constraints"
+                    "Status": "Grouped ✓",
+                    "Details": f"Scheduled together on **{sa}**."
                 })
+                continue
+
+            if sa and sb and sa != sb:
+                report_rows.append({
+                    "Pair": f"{a_can} & {b_can}",
+                    "Status": "Not grouped ✗",
+                    "Details": (
+                        f"Both were scheduled but on different shifts — **{a_can} → {sa}**, "
+                        f"**{b_can} → {sb}**. Try freeing space or adjusting their preferences."
+                    )
+                })
+                continue
+
+            not_placed = []
+            if not sa: not_placed.append(a_can)
+            if not sb: not_placed.append(b_can)
+            who = f"{not_placed[0]} and {not_placed[1]}" if len(not_placed) == 2 else not_placed[0]
+            report_rows.append({
+                "Pair": f"{a_can} & {b_can}",
+                "Status": "Not in schedule",
+                "Details": f"We couldn't place {who} given availability, capacity, and mentor/mentee rules."
+            })
+
         st.session_state.group_report = pd.DataFrame(report_rows)
 
 # ── Display Results ──────────────────────────────────────────────────────────
@@ -263,10 +310,11 @@ if st.session_state.sched_df is not None:
         if sh in grid and d in grid[sh]:
             grid[sh][d].append((row["Name"], row.get("Role", ""), bool(row["Fallback"])))
 
-    # Grouping results table (shown BEFORE the schedule preview)
+    # Grouping results table (before schedule preview)
     if st.session_state.group_report is not None and not st.session_state.group_report.empty:
         st.subheader("Group-Together Results")
-        st.dataframe(st.session_state.group_report, use_container_width=True)
+        styled = style_group_report(st.session_state.group_report)
+        st.table(styled)
 
     # ── HTML Grid ──────────────────────────────────────────────────────────────
     html = "<table style='border-collapse: collapse; width:100%;'>"
