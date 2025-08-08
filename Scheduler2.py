@@ -16,18 +16,16 @@ GROUP_PAIRS = []  # set by Streamlit: list of (nameA, nameB)
 # ----------------------------------
 def _normalize_role(s: str) -> str:
     """
-    Canonical roles (more tolerant):
-      - contains 'mentor in training' or ' mit ' -> 'mit'
-      - contains 'mentor' (and NOT 'in training') -> 'mentor'
-      - contains 'mentee' or 'trainee' or 'new volunteer' -> 'mentee'
-      - otherwise -> 'volunteer'
+    Canonical roles (tolerant):
+      - contains 'mentor in training' or standalone 'mit' -> 'mit'
+      - contains 'mentor' (and NOT 'in training')        -> 'mentor'
+      - contains 'mentee' / 'trainee' / 'new volunteer'  -> 'mentee'
+      - otherwise                                         -> 'volunteer'
     """
     r = re.sub(r"\s+", " ", str(s).strip().lower())
     r = r.replace("-", " ")
-    # match 'mentor in training' OR exact 'mit'
     if "mentor in training" in r or re.search(r"\bmit\b", r):
         return "mit"
-    # any other 'mentor' counts as mentor
     if "mentor" in r:
         return "mentor"
     if any(k in r for k in ["mentee", "trainee", "new volunteer", "newvolunteer"]):
@@ -44,26 +42,110 @@ DAY_MAP = {
     "sun": "Sunday", "sunday": "Sunday",
 }
 
+def _fmt_24h(minutes: int) -> str:
+    """Return HH:MM from minutes since midnight."""
+    h = (minutes // 60) % 24
+    m = minutes % 60
+    return f"{h:02d}:{m:02d}"
+
+def _parse_time_component(t: str):
+    """
+    Parse a single time like '10', '10:30', '2pm', '2:30 PM', '14:00'.
+    Returns (minutes, has_meridian) where minutes is 0..1439 and has_meridian is bool.
+    """
+    s = re.sub(r"\s+", "", str(t).lower())
+    s = s.replace(".", "")
+    m = re.match(r"^(\d{1,2})(?::?(\d{2}))?(am|pm)?$", s)
+    if not m:
+        # give up: return NaN to signal failure
+        return float("nan"), False
+    hh = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    mer = m.group(3)
+    if mer:
+        hh = hh % 12
+        if mer == "pm":
+            hh += 12
+        return hh * 60 + mm, True
+    # No meridian → interpret as 24h if in range; else NaN
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return hh * 60 + mm, False
+    return float("nan"), False
+
+def _parse_time_range_to_24h(range_text: str) -> str | None:
+    """
+    Parse '10-2pm', '10:00-14:00', '10am - 2:30pm', '10.00AM-2.00 PM' → 'HH:MM-HH:MM' (24h).
+    Strategy:
+      - parse both ends; if only one has am/pm, assume the other matches that meridian.
+      - if both lack am/pm, assume 24h clock.
+    """
+    txt = str(range_text or "")
+    txt = txt.replace("–", "-").replace("—", "-").replace("−", "-")
+    # allow "to" as a separator as well
+    txt = re.sub(r"\bto\b", "-", txt, flags=re.IGNORECASE)
+    parts = [p for p in txt.split("-") if p.strip()]
+    if len(parts) != 2:
+        return None
+    left_raw, right_raw = parts[0].strip(), parts[1].strip()
+
+    left_min, left_has = _parse_time_component(left_raw)
+    right_min, right_has = _parse_time_component(right_raw)
+
+    # If parse failed on either, bail
+    if left_min != left_min or right_min != right_min:  # NaN check
+        return None
+
+    # If only one side has meridian, try to align the other to the same half-day
+    if left_has and not right_has:
+        # try same meridian as left; if that makes end < start, keep 24h parsed end
+        # (we already parsed right as 24h)
+        pass  # nothing to adjust
+    elif right_has and not left_has:
+        # Make left match right's half-day if left was 1..12 without meridian and looked like 0..11 24h
+        # We can’t know the original hour; but if left was <= 12 and currently < 12:00 and right is PM,
+        # interpret left as PM to avoid weird 22:00 interpretations.
+        # Re-parse left with the right meridian if left hour <=12 originally.
+        m = re.match(r"^\s*(\d{1,2})(?::?(\d{2}))?\s*$", left_raw)
+        if m:
+            hh = int(m.group(1))
+            mm = int(m.group(2) or 0)
+            if 1 <= hh <= 12:
+                # adopt right meridian
+                right_mer = re.search(r"(am|pm)", right_raw.lower())
+                if right_mer:
+                    mer = right_mer.group(1)
+                    hh2 = hh % 12
+                    if mer == "pm":
+                        hh2 += 12
+                    left_min = hh2 * 60 + mm
+
+    # If still inverted (start >= end) but both under 24h, leave as-is; we don't handle overnight
+    return f"{_fmt_24h(int(left_min))}-{_fmt_24h(int(right_min))}"
+
 def _norm_slot(s: str) -> str:
     """
-    Conservative normalization for 'Day HH:MM-HH:MM' (or AM/PM-ish variants):
-      - normalize unicode dashes to '-'
-      - collapse spaces
-      - map day via DAY_MAP
+    Normalize 'Day time-range' to 'Day HH:MM-HH:MM' (24h). Tolerates AM/PM and messy spaces/dashes.
     """
     s = str(s or "").strip()
     if not s:
         return ""
     s = re.sub(r"[–—−]", "-", s)          # normalize em/en dashes
     s = re.sub(r"\s+", " ", s).strip()    # collapse spaces
+    # Split day vs rest
     parts = s.split(" ", 1)
     if len(parts) < 2:
-        return s
+        return s  # not a recognizable slot; return as-is
     day_raw, rest = parts[0], parts[1]
     day = DAY_MAP.get(day_raw.lower(), day_raw.title())
-    rest = rest.replace(" ", "")
-    rest = re.sub(r"-+", "-", rest)       # ensure single hyphen
-    return f"{day} {rest}"
+    rest = rest.strip()
+    # Convert rest to 'HH:MM-HH:MM' 24h
+    range_24 = _parse_time_range_to_24h(rest)
+    if not range_24:
+        # last resort: clean hyphens/spaces and hope it's already HH:MM-HH:MM
+        rest = rest.replace(" ", "")
+        rest = re.sub(r"-+", "-", rest)
+        range_24 = rest
+    return f"{day} {range_24}"
 
 def _clean_pairs(volunteers, pairs):
     """Remove self/unknown/duplicate pairs; keep input order."""
@@ -108,7 +190,7 @@ def load_preferences(df: pd.DataFrame):
     Returns:
       volunteers: list[str]
       roles: dict[name -> role]
-      shifts: list[str]
+      shifts: list[str] (normalized to 'Day HH:MM-HH:MM' 24h)
       weights: dict[(name, shift) -> int]
       prefs_map: dict[name -> list[str]]
     Raises:
@@ -175,7 +257,7 @@ def load_preferences(df: pd.DataFrame):
         for c in ordered_pref_cols:
             val = row.get(c, None)
             if pd.notna(val):
-                ns = _norm_slot(val)
+                ns = _norm_slot(val)  # normalize to Day HH:MM-HH:MM (24h) if possible
                 if ns:
                     prefs.append(ns)
         prefs_map[name] = prefs
@@ -225,7 +307,7 @@ def solve_schedule(volunteers, roles, shifts, weights):
             model1.Add(x1[(a, s)] == x1[(b, s)])
 
     # Coverage with big-M:
-    # z1_s = 1 if a mentor is present on shift s
+    # z1_s = 1 if a mentor is present on shift s.
     if mentees:
         z1 = {s: model1.NewBoolVar(f"z1_mentor_present_{s}") for s in shifts}
         for s in shifts:
@@ -358,7 +440,7 @@ def prepare_schedule_df(schedule: dict) -> pd.DataFrame:
     for slot, items in schedule.items():
         for a in items:
             rows.append({
-                "Time Slot": slot,
+                "Time Slot": slot,            # already normalized to Day HH:MM-HH:MM (24h)
                 "Name": a.get("Name", ""),
                 "Role": a.get("Role", "volunteer"),
                 "Fallback": bool(a.get("Fallback", False)),
@@ -395,7 +477,7 @@ def compute_breakdown(schedule: dict, prefs_map: dict[str, list[str]]) -> pd.Dat
 def build_schedule(df: pd.DataFrame):
     """
     Returns:
-      sched_df:      [Time Slot, Name, Role, Fallback]
+      sched_df:      [Time Slot, Name, Role, Fallback]  (Time Slot is 24h)
       unassigned_df: [Name]
       breakdown_df:  [Preference, Count, Percentage]
     """
