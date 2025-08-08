@@ -110,8 +110,8 @@ if uploader:
             parts = [p.strip() for p in line.split(',')]
             new_parts = [rep_map.get(p, p) for p in parts if p]
             new_lines.append(', '.join(new_parts))
-        return "
-".join(new_lines)
+        return '
+'.join(new_lines)
 
     def _replace_one_cb(raw: str, sugg: str):
         text = st.session_state.get("pairs_text", "") or ""
