@@ -5,8 +5,8 @@ import Scheduler2  # scheduling core module
 from Scheduler2 import build_schedule, MAX_PER_SHIFT, load_preferences
 
 # ── Page configuration ──────────────────────────────────────────────────────
-st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3", layout="wide")
-st.title("📅 PEMRAP Volunteer Scheduler V3")
+st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3.5", layout="wide")
+st.title("📅 PEMRAP Volunteer Scheduler V3.5")
 
 # ── Initialize session state ─────────────────────────────────────────────────
 for key, default in (
@@ -706,3 +706,4 @@ if st.session_state.sched_df is not None:
         file_name="schedule.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
