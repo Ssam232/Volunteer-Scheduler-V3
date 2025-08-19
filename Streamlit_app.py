@@ -5,8 +5,8 @@ import Scheduler2  # scheduling core module
 from Scheduler2 import build_schedule, MAX_PER_SHIFT, load_preferences
 
 # ── Page configuration ──────────────────────────────────────────────────────
-st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3", layout="wide")
-st.title("📅 PEMRAP Volunteer Scheduler V3")
+st.set_page_config(page_title="PEMRAP Volunteer Scheduler V3.5", layout="wide")
+st.title("📅 PEMRAP Volunteer Scheduler V3.5")
 
 # ── Initialize session state ─────────────────────────────────────────────────
 for key, default in (
@@ -14,8 +14,8 @@ for key, default in (
     ("sched_df", None),
     ("breakdown_df", None),
     ("group_report", None),
-    ("pairs_text", ""),
-    ("trigger_run", False),
+    ("pairs_text", ""),          # model value we control
+    ("trigger_run", False),      # flag to auto-run after fixes
 ):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -348,17 +348,22 @@ st.subheader("Group-Together Exceptions")
 st.write("Enter each pair on its own line: First Last, First Last")
 st.write("_Leave blank and run if no exceptions._")
 
+# IMPORTANT: decouple widget key from model key to avoid Streamlit mutation errors
+pairs_default = st.session_state.get("pairs_text", "") or ""
 pairs_input = st.text_area(
     "Pairs (one per line)",
-    key="pairs_text",
+    key="pairs_text_widget",          # widget's own key
+    value=pairs_default,              # initial content driven by our model key
     placeholder="Alice Smith, Bob Jones",
     height=100,
-).strip()
+)
+# Sync user edits back into the model key (safe – we're not mutating the widget key)
+st.session_state["pairs_text"] = (pairs_input or "").strip()
 
 # Build suggestions (clickable)
 suggestions: list[tuple[str, str | None]] = []  # (raw_name, suggested or None)
-if pairs_input:
-    for line in pairs_input.splitlines():
+if st.session_state["pairs_text"]:
+    for line in st.session_state["pairs_text"].splitlines():
         parts = [p.strip() for p in line.split(",") if p.strip()]
         if len(parts) != 2:
             continue
@@ -377,19 +382,21 @@ if pairs_input:
         if not a_can: suggestions.append((a_raw, a_sugg))
         if not b_can: suggestions.append((b_raw, b_sugg))
 
-def _apply_and_rerun(replacements: list[tuple[str, str]]):
-    # de-duplicate replacements for safety
-    uniq = []
-    seen = set()
+def _apply_fixes(replacements: list[tuple[str, str]]):
+    """Update model text and mark to auto-run on next rerun."""
+    # de-duplicate
+    uniq, seen = [], set()
     for raw, sugg in replacements:
+        if not sugg:
+            continue
         key = (raw, sugg)
-        if key not in seen and sugg:
+        if key not in seen:
             uniq.append((raw, sugg))
             seen.add(key)
     text = st.session_state.get("pairs_text", "") or ""
     st.session_state["pairs_text"] = _replace_tokens(text, uniq)
     st.session_state["trigger_run"] = True
-    st.rerun()
+    # DO NOT touch 'pairs_text_widget' here; the next rerun will feed value=... automatically.
 
 if suggestions:
     st.markdown("**Name fixes:** click to apply")
@@ -397,27 +404,19 @@ if suggestions:
     fixable = [(raw, sugg) for (raw, sugg) in suggestions if sugg]
     for i, (raw, sugg) in enumerate(suggestions):
         if sugg:
-            cols[i % 2].button(
-                f'Replace "{raw}" → "{sugg}"',
-                key=f"fix_{i}",
-                on_click=_apply_and_rerun,
-                args=([(raw, sugg)],),
-            )
+            if cols[i % 2].button(f'Replace "{raw}" → "{sugg}"', key=f"fix_{i}"):
+                _apply_fixes([(raw, sugg)])
         else:
             cols[i % 2].markdown(f"⚠️ **{raw}** — no close match found")
     if fixable:
-        st.button(
-            "Apply all fixes",
-            key="apply_all_fixes",
-            on_click=_apply_and_rerun,
-            args=(fixable,),
-        )
+        if st.button("Apply all fixes", key="apply_all_fixes"):
+            _apply_fixes(fixable)
 
 # Manual run button
 if st.button("Run Scheduler"):
     run_scheduler(df_raw, vol_lookup)
 
-# Auto-run if a fix was applied
+# Auto-run if a fix was applied (button press causes rerun; this consumes the flag)
 if st.session_state.trigger_run:
     st.session_state.trigger_run = False
     run_scheduler(df_raw, vol_lookup)
@@ -512,6 +511,24 @@ if st.session_state.sched_df is not None:
     legend += "<span style='display:inline-block;margin-right:16px;'>Current volunteer</span>"
     legend += "</div>"
     st.markdown(legend, unsafe_allow_html=True)
+
+    # ── Shift Coverage Summary (above Preference Breakdown) ───────────────────
+    total_cells = len(days) * len(shifts)
+    non_empty = sum(1 for sh in shifts for d in days if len(grid.get(sh, {}).get(d, [])) > 0)
+    empty_cells = total_cells - non_empty
+    full_cells = sum(1 for sh in shifts for d in days if len(grid.get(sh, {}).get(d, [])) >= MAX_PER_SHIFT)
+    total_people = sum(len(grid.get(sh, {}).get(d, [])) for sh in shifts for d in days)
+    avg_occ = (total_people / total_cells) if total_cells else 0.0
+
+    coverage_rows = [
+        {"Metric": "Total shifts", "Value": total_cells},
+        {"Metric": "Occupied shifts", "Value": non_empty},
+        {"Metric": "Empty shifts", "Value": empty_cells},
+        {"Metric": f"Fully filled shifts (Volunteers = {MAX_PER_SHIFT})", "Value": full_cells},
+        {"Metric": "Average volunteers per shift", "Value": f"{avg_occ:.0f}"},
+    ]
+    st.subheader("Shift Coverage Summary")
+    st.dataframe(pd.DataFrame(coverage_rows), use_container_width=True)
 
     # Preference Breakdown
     st.subheader("Preference Breakdown")
