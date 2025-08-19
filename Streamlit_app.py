@@ -37,13 +37,11 @@ def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 def norm_name(s: str) -> str:
-    # accent/case/whitespace-insensitive
     s = _strip_accents(str(s))
     s = re.sub(r"\s+", " ", s).strip()
     return s.casefold()
 
 def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
-    """Build a clean Name list for the Group UI from the raw sheet."""
     cols = {c.lower(): c for c in df.columns}
     first = next((cols[k] for k in cols if "first" in k and "name" in k), None)
     last  = next((cols[k] for k in cols if "last"  in k and "name" in k), None)
@@ -59,22 +57,20 @@ def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
     return sorted(names)
 
 def style_group_report(df: pd.DataFrame):
-    """Colorized result rows, version-safe with st.dataframe(Styler)."""
     def _row_style(row):
         status = str(row.get("Status", ""))
         if "Grouped ✓" in status:
-            bg, fg = "#0f3d1e", "#b9f6ca"   # dark green bg, mint text
+            bg, fg = "#0f3d1e", "#b9f6ca"
         elif "Not grouped" in status or "Not in schedule" in status:
-            bg, fg = "#3d0f12", "#ff8a80"   # dark red bg, soft red text
+            bg, fg = "#3d0f12", "#ff8a80"
         elif "Skipped" in status:
-            bg, fg = "#3d2a00", "#ffd54f"   # dark amber bg, amber text
+            bg, fg = "#3d2a00", "#ffd54f"
         else:
-            bg, fg = "#263238", "#eceff1"   # slate bg, light text
+            bg, fg = "#263238", "#eceff1"
         return [f"background-color: {bg}; color: {fg};"] * len(row)
     return df.style.apply(_row_style, axis=1).set_properties(**{"white-space": "nowrap"})
 
 def build_placement_maps(sched_df: pd.DataFrame):
-    """Return maps of placement and forced flags by normalized name."""
     tmp = sched_df.copy()
     if "Day" not in tmp.columns or "Shift" not in tmp.columns:
         ts_tmp = tmp["Time Slot"].astype(str)
@@ -85,7 +81,6 @@ def build_placement_maps(sched_df: pd.DataFrame):
 
     placed_by_key: dict[str, str] = {}
     forced_by_key: dict[str, bool] = {}
-
     for _, r in tmp.iterrows():
         key = r["_key"]
         day = str(r.get("Day", "")).strip()
@@ -98,7 +93,6 @@ def build_placement_maps(sched_df: pd.DataFrame):
     return placed_by_key, forced_by_key
 
 def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
-    """Replace exact tokens between commas across lines."""
     lines = (text or "").splitlines()
     rep_map = {raw: sugg for raw, sugg in replacements if sugg}
     new_lines = []
@@ -109,7 +103,6 @@ def _replace_tokens(text: str, replacements: list[tuple[str, str]]) -> str:
     return "\n".join(new_lines)
 
 def parse_time_to_minutes(s: str) -> int | float:
-    """Robust time parser for 'HH:MM' or 'H:MMam/pm' and similar. Returns minutes from 00:00."""
     s = (s or "").strip().lower()
     s = re.sub(r"[–—−]", "-", s)
     s = re.sub(r"\s+", "", s)
@@ -123,9 +116,7 @@ def parse_time_to_minutes(s: str) -> int | float:
                 h += 12
             return h * 60
         return float("inf")
-    h = int(m.group(1))
-    mm = int(m.group(2))
-    ampm = m.group(3)
+    h = int(m.group(1)); mm = int(m.group(2)); ampm = m.group(3)
     if ampm:
         h = h % 12
         if ampm == "pm":
@@ -163,7 +154,7 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
         roles_here = [rl for _, rl, _ in entries]
         roles_aug = roles_here + [roles.get(a_can, ""), roles.get(b_can, "")]
         any_mentee = any(r == "mentee" for r in roles_aug)
-        any_mentor = any(r == "mentor" for r in roles_aug)  # MIT not counted
+        any_mentor = any(r == "mentor" for r in roles_aug)
         if any_mentee and not any_mentor:
             continue
         mentor_block = False
@@ -180,31 +171,20 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
         return "Shared slots would break mentor coverage (mentee present without a mentor)."
     return "Grouping would worsen the objective under current constraints."
 
-# ---------------- NEW: preference rows helper (dynamic) ----------------------
+# ---------------- Preference helpers (dynamic rows + fade) -------------------
 def _max_choice_count_from_survey(df_raw: pd.DataFrame) -> int:
-    """
-    Detect the maximum number of ranked choices present in the survey.
-    Falls back to 5 if parsing fails.
-    """
     try:
         _, _, _, _, prefs_map = load_preferences(df_raw)
         mx = max((len(v) for v in prefs_map.values()), default=0)
-        # Your solver only ranks up to 5; cap to 5 to avoid surprises
         return max(0, min(5, mx))
     except Exception:
         return 5
 
 def _rename_and_filter_breakdown(breakdown_df: pd.DataFrame, df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Keep only up to the max choice count present in the survey, and rename
-    rows to '1st choice', '2nd choice', ...
-    Always retain 'Fallback'.
-    """
     if breakdown_df is None or breakdown_df.empty:
         return breakdown_df
 
     max_choices = _max_choice_count_from_survey(df_raw)
-
     order_src = ["1st","2nd","3rd","4th","5th"]
     keep_src = order_src[:max_choices] if max_choices > 0 else []
     keep_src += ["Fallback"]
@@ -212,20 +192,29 @@ def _rename_and_filter_breakdown(breakdown_df: pd.DataFrame, df_raw: pd.DataFram
     df = breakdown_df.copy()
     df = df[df["Preference"].isin(keep_src)]
 
-    rename_map = {f"{i}st": f"{i}st choice" for i in [1]}
-    rename_map.update({f"{i}nd": f"{i}nd choice" for i in [2]})
-    rename_map.update({f"{i}rd": f"{i}rd choice" for i in [3]})
-    rename_map.update({f"{i}th": f"{i}th choice" for i in [4,5]})
-
+    rename_map = {"1st":"1st choice","2nd":"2nd choice","3rd":"3rd choice","4th":"4th choice","5th":"5th choice"}
     df["Preference"] = df["Preference"].replace(rename_map)
-    # keep order as displayed
+
     pref_order = [rename_map.get(s, s) for s in keep_src]
     df["__ord"] = df["Preference"].apply(lambda x: pref_order.index(x) if x in pref_order else 999)
     df = df.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
     return df
 
+def style_pref_breakdown(df: pd.DataFrame):
+    """Fade rows where Count == 0 (grey text)."""
+    if df is None or df.empty:
+        return df
+    def _row_style(row):
+        try:
+            cnt = int(str(row.get("Count", 0)).split(".")[0])
+        except Exception:
+            cnt = 0 if str(row.get("Count", "")).strip() == "0" else 1
+        if cnt == 0:
+            return ["color: #9E9E9E;"] * len(row)  # faded
+        return [""] * len(row)
+    return df.style.apply(_row_style, axis=1)
+
 def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
-    """Run the solver using current pairs_text and store results in session_state."""
     pairs_text = (st.session_state.get("pairs_text") or "").strip()
     valid_pairs_run, raw_pairs_run = [], []
     if pairs_text:
@@ -240,15 +229,13 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
             if a_can and b_can and a_can != b_can:
                 valid_pairs_run.append((a_can, b_can))
 
-    # Apply and solve safely
-    Scheduler2.GROUP_PAIRS = list(dict.fromkeys(valid_pairs_run))  # dedupe, keep order
+    Scheduler2.GROUP_PAIRS = list(dict.fromkeys(valid_pairs_run))
     try:
         sched_df, unassigned_df, breakdown_df = build_schedule(df_raw)
     except Exception as e:
         st.error(f"Scheduling failed: {e}")
         return
 
-    # Parse Day/Shift from normalized Time Slot ('Day HH:MM-HH:MM')
     if "Time Slot" in sched_df.columns:
         ts = sched_df["Time Slot"].astype(str)
         parts = ts.str.split(r"\s+", n=1, expand=True)
@@ -258,17 +245,14 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     else:
         sched_df["Day"], sched_df["Shift"] = "", ""
 
-    # Enforce Mon→Sun (ordered categorical) + chronological sorting
     sched_df["Day"] = pd.Categorical(sched_df["Day"], categories=DAY_ORDER, ordered=True)
     sched_df["__k"] = sched_df["Shift"].map(parse_time_to_minutes)
     sched_df = sched_df.sort_values(["Day", "__k", "Shift", "Name"]).drop(columns="__k")
 
-    # Save in session state
     st.session_state.sched_df = sched_df
     st.session_state.unassigned_df = unassigned_df
     st.session_state.breakdown_df = breakdown_df
 
-    # Group report
     placed_by_key, forced_by_key = build_placement_maps(sched_df)
     report_rows = []
     for a_raw, b_raw in raw_pairs_run:
@@ -361,7 +345,7 @@ def validate_preference_strings(df_raw: pd.DataFrame):
 # ── File upload ──────────────────────────────────────────────────────────────
 uploader = st.file_uploader("Upload survey XLSX", type="xlsx")
 
-# Reset the app when the file is removed
+# Reset app when file removed
 if not uploader:
     st.session_state.df_raw = None
     st.session_state.sched_df = None
@@ -382,7 +366,7 @@ if st.session_state.df_raw is None:
         st.stop()
 df_raw = st.session_state.df_raw
 
-# Data hygiene checks
+# Hygiene checks
 validate_names(df_raw)
 validate_preference_strings(df_raw)
 
@@ -390,7 +374,7 @@ validate_preference_strings(df_raw)
 ui_names = extract_names_for_ui(df_raw)
 vol_lookup = {norm_name(n): n for n in ui_names}
 
-# ── Group-Together Exceptions UI (with clickable typo fixes) ─────────────
+# ── Group-Together Exceptions UI ────────────────────────────────────────────
 st.subheader("Group-Together Exceptions")
 st.write("Enter each pair on its own line: First Last, First Last")
 st.write("_Leave blank and run if no exceptions._")
@@ -402,7 +386,7 @@ pairs_input = st.text_area(
     height=100,
 ).strip()
 
-# Build suggestions (clickable)
+# Suggestions (clickable)
 suggestions: list[tuple[str, str | None]] = []
 if pairs_input:
     for line in pairs_input.splitlines():
@@ -425,14 +409,11 @@ if pairs_input:
         if not b_can: suggestions.append((b_raw, b_sugg))
 
 def _apply_and_rerun(replacements: list[tuple[str, str]]):
-    # de-duplicate replacements for safety
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for raw, sugg in replacements:
         key = (raw, sugg)
         if key not in seen and sugg:
-            uniq.append((raw, sugg))
-            seen.add(key)
+            uniq.append((raw, sugg)); seen.add(key)
     text = st.session_state.get("pairs_text", "") or ""
     st.session_state["pairs_text"] = _replace_tokens(text, uniq)
     st.session_state["trigger_run"] = True
@@ -464,7 +445,7 @@ if suggestions:
 if st.button("Run Scheduler"):
     run_scheduler(df_raw, vol_lookup)
 
-# Auto-run if a fix was applied
+# Auto-run after fixes
 if st.session_state.trigger_run:
     st.session_state.trigger_run = False
     run_scheduler(df_raw, vol_lookup)
@@ -479,11 +460,9 @@ if st.session_state.sched_df is not None:
     has_mentor = roles_series.eq("mentor").any()
     has_mentee = roles_series.eq("mentee").any()
     has_mit    = roles_series.eq("mit").any()
-    has_vol    = ~roles_series.isin(["mentor","mentee","mit"])
-    has_vol    = bool(has_vol.any())
+    has_vol    = bool((~roles_series.isin(["mentor","mentee","mit"])).any())
     has_forced = bool(sched_df.get("Fallback", pd.Series([], dtype=bool)).any())
 
-    # Ordered axes for grid/export
     days = [d for d in DAY_ORDER if (sched_df["Day"] == d).any()]
     shifts = (
         sched_df[["Shift"]]
@@ -493,7 +472,6 @@ if st.session_state.sched_df is not None:
         .tolist()
     )
 
-    # Build grid safely
     grid = {sh: {d: [] for d in days} for sh in shifts}
     for _, row in sched_df.iterrows():
         d = str(row.get("Day", "")).strip()
@@ -504,13 +482,12 @@ if st.session_state.sched_df is not None:
             fb = bool(row.get("Fallback", False))
             grid[sh][d].append((nm, role, fb))
 
-    # Grouping results before schedule preview
     if st.session_state.group_report is not None and not st.session_state.group_report.empty:
         st.subheader("Group-Together Results")
         styled = style_group_report(st.session_state.group_report)
         st.dataframe(styled, use_container_width=True)
 
-    # ── HTML Grid (light theme) ───────────────────────────────────────────────
+    # Grid preview
     html_grid = "<table style='border-collapse: collapse; width:100%;'>"
     html_grid += "<tr><th style='border:1px solid #ddd; padding:8px;'></th>" + \
                  "".join(f"<th style='border:1px solid #ddd; padding:8px;'>{d}</th>" for d in days) + \
@@ -552,7 +529,7 @@ if st.session_state.sched_df is not None:
     )
     st.markdown(html_grid, unsafe_allow_html=True)
 
-    # ── Dynamic Legend (only show items that actually appear) ────────────────
+    # Dynamic legend
     legend_parts = []
     if has_mentor:
         legend_parts.append("<span style='display:inline-block;margin-right:16px;'><strong>Mentor</strong></span>")
@@ -564,11 +541,10 @@ if st.session_state.sched_df is not None:
         legend_parts.append("<span style='display:inline-block;margin-right:16px;'>* Forced</span>")
     if has_vol:
         legend_parts.append("<span style='display:inline-block;margin-right:16px;'>Current volunteer</span>")
-
     if legend_parts:
         st.markdown("<div style='margin:12px 0;'>" + "".join(legend_parts) + "</div>", unsafe_allow_html=True)
 
-    # ── Coverage Summary (above Preference Breakdown) ────────────────────────
+    # Coverage summary
     total_cells = len(days) * len(shifts)
     non_empty = sum(1 for sh in shifts for d in days if len(grid.get(sh, {}).get(d, [])) > 0)
     empty_cells = total_cells - non_empty
@@ -586,17 +562,18 @@ if st.session_state.sched_df is not None:
     st.subheader("Shift Coverage Summary")
     st.dataframe(pd.DataFrame(coverage_rows), use_container_width=True)
 
-    # ── Preference Breakdown (trimmed to max choices; renamed) ───────────────
-    trimmed_breakdown = _rename_and_filter_breakdown(breakdown_df, df_raw)
+    # Preference Breakdown (trim + fade)
     st.subheader("Preference Breakdown")
-    st.dataframe(trimmed_breakdown, use_container_width=True)
+    trimmed_breakdown = _rename_and_filter_breakdown(breakdown_df, df_raw)
+    styled_pref = style_pref_breakdown(trimmed_breakdown)
+    st.dataframe(styled_pref, use_container_width=True)
 
-    # ── Unassigned (only if non-empty) ───────────────────────────────────────
+    # Unassigned (only if non-empty)
     if isinstance(unassigned_df, pd.DataFrame) and not unassigned_df.empty:
         st.subheader("Unassigned Volunteers")
         st.dataframe(unassigned_df, use_container_width=True)
 
-    # ── Forced Assignments list ──────────────────────────────────────────────
+    # Forced list
     st.subheader("Forced Assignments")
     fb = sched_df[sched_df.get("Fallback", False) == True] if "Fallback" in sched_df.columns else pd.DataFrame()
     if not fb.empty:
@@ -605,7 +582,7 @@ if st.session_state.sched_df is not None:
     else:
         st.write("_None_")
 
-    # ── Excel export (formatted if xlsxwriter) ───────────────────────────────
+    # Excel export
     def to_excel_bytes():
         buf = io.BytesIO()
         try:
@@ -614,14 +591,14 @@ if st.session_state.sched_df is not None:
         except Exception:
             engine = "openpyxl"
 
-        # local copies for export
-        days_local = days[:]
-        shifts_local = shifts[:]
-        has_mentor_l = has_mentor
-        has_mentee_l = has_mentee
-        has_mit_l    = has_mit
-        has_forced_l = has_forced
-        has_vol_l    = has_vol
+        days_local = [d for d in DAY_ORDER if (sched_df["Day"] == d).any()]
+        shifts_local = (
+            sched_df[["Shift"]]
+            .drop_duplicates()
+            .assign(_k=lambda x: x["Shift"].map(parse_time_to_minutes))
+            .sort_values(["_k", "Shift"])["Shift"]
+            .tolist()
+        )
         trimmed_pref = _rename_and_filter_breakdown(breakdown_df, df_raw)
 
         if engine == "xlsxwriter":
@@ -632,8 +609,9 @@ if st.session_state.sched_df is not None:
                 mentee_fmt = wb.add_format({"border": 1, "bg_color": "#ADD8E6"})
                 mit_fmt    = wb.add_format({"border": 1, "italic": True})
                 vol_fmt    = wb.add_format({"border": 1})
+                faded_fmt  = wb.add_format({"font_color": "#9E9E9E"})
 
-                # Build grid dict safely for export
+                # Grid sheet
                 grid_x = {sh: {d: [] for d in days_local} for sh in shifts_local}
                 for _, r in sched_df.iterrows():
                     d = str(r.get("Day", "")).strip()
@@ -641,7 +619,6 @@ if st.session_state.sched_df is not None:
                     if sh in grid_x and d in grid_x[sh]:
                         grid_x[sh][d].append((str(r.get("Name","")), str(r.get("Role","")).lower(), bool(r.get("Fallback", False))))
 
-                # Grid sheet
                 ws = wb.add_worksheet("Grid")
                 ws.write_blank(0, 0, None, border)
                 for c, day in enumerate(days_local, start=1):
@@ -668,12 +645,11 @@ if st.session_state.sched_df is not None:
 
                 # Legend row (dynamic)
                 legend_cols = []
-                if has_mentor_l: legend_cols.append(("Mentor", mentor_fmt))
-                if has_mentee_l: legend_cols.append(("Mentee", mentee_fmt))
-                if has_mit_l:    legend_cols.append(("Mentor in training", mit_fmt))
-                if has_forced_l: legend_cols.append(("* Forced", border))
-                if has_vol_l:    legend_cols.append(("Current volunteer", border))
-
+                if has_mentor: legend_cols.append(("Mentor", mentor_fmt))
+                if has_mentee: legend_cols.append(("Mentee", mentee_fmt))
+                if has_mit:    legend_cols.append(("Mentor in training", mit_fmt))
+                if has_forced: legend_cols.append(("* Forced", border))
+                if has_vol:    legend_cols.append(("Current volunteer", border))
                 if legend_cols:
                     row_idx += 1
                     ws.write(row_idx, 0, "Legend:", border)
@@ -682,13 +658,32 @@ if st.session_state.sched_df is not None:
                         ws.write(row_idx, c, label, fmt)
                         c += 1
 
-                # Preferences (trimmed) & Fallback sheets
+                # Preferences (trimmed) with fade on zero counts
                 trimmed_pref.to_excel(writer, sheet_name="Preferences", index=False)
+                ws_pref = writer.sheets["Preferences"]
+                if not trimmed_pref.empty and "Count" in trimmed_pref.columns:
+                    # Find column bounds dynamically (A..last)
+                    last_col_idx = len(trimmed_pref.columns) - 1
+                    last_row_idx = len(trimmed_pref) + 1  # +1 header row
+                    # Apply grey text to entire row when Count==0
+                    # Count is usually column B (index 1); anchor formula to $B row
+                    count_col_letter = chr(ord('A') + list(trimmed_pref.columns).index("Count"))
+                    rng = f"A2:{chr(ord('A') + last_col_idx)}{last_row_idx}"
+                    ws_pref.conditional_format(
+                        rng,
+                        {
+                            "type": "formula",
+                            "criteria": f"=${count_col_letter}2=0",
+                            "format": faded_fmt,
+                        },
+                    )
+
+                # Fallback sheet
                 fb_df = sched_df[sched_df.get("Fallback", False) == True][["Time Slot","Name","Role"]] \
                         if "Fallback" in sched_df.columns else pd.DataFrame(columns=["Time Slot","Name","Role"])
                 fb_df.to_excel(writer, sheet_name="Fallback", index=False)
 
-                # Optional: Unassigned sheet if present
+                # Optional Unassigned sheet
                 if isinstance(unassigned_df, pd.DataFrame) and not unassigned_df.empty:
                     unassigned_df.to_excel(writer, sheet_name="Unassigned", index=False)
 
