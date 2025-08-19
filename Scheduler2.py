@@ -7,9 +7,9 @@ from ortools.sat.python import cp_model
 # Configuration
 # ----------------------------------
 MAX_PER_SHIFT = 3
-# Phase-2 preference weights (after minimizing fallbacks)
+# Preference weights used only as a final tie-break after tiered fill
 LEX_WEIGHTS = {1: 100000, 2: 10000, 3: 1000, 4: 100, 5: 10}
-FALLBACK_WEIGHT = 0
+
 # Filled by Streamlit: list of (nameA, nameB) to schedule together
 GROUP_PAIRS = []
 
@@ -211,8 +211,9 @@ def load_preferences(df: pd.DataFrame):
       volunteers: list[str]
       roles: dict[name -> role]
       shifts: list[str] (normalized to 'Day HH:MM-HH:MM' 24h)
-      weights: dict[(name, shift) -> int]
+      weights: dict[(name, shift) -> int]     (available pairs only)
       prefs_map: dict[name -> list[str]]
+      A: dict[(name, shift) -> 0/1]           (availability mask)
     Raises:
       ValueError if required data is missing.
     """
@@ -247,7 +248,7 @@ def load_preferences(df: pd.DataFrame):
     if not volunteers:
         raise ValueError("No volunteers found after parsing names.")
 
-    # Preference columns (tolerant)
+    # Preference columns (tolerant: "choice" or "availability")
     pref_cols = []
     for c in df.columns:
         cl = str(c).lower()
@@ -288,142 +289,181 @@ def load_preferences(df: pd.DataFrame):
         raise ValueError("No valid shift strings found in preferences.")
     shifts = sorted(shifts_set)
 
-    # Weights
+    # Build weights (for available pairs only) and availability mask A
     weights = {}
+    A = {}
     for name, prefs in prefs_map.items():
-        for rank, slot in enumerate(prefs, start=1):
-            weights[(name, slot)] = LEX_WEIGHTS.get(rank, 0)
-    for name in volunteers:
+        pref_set = set(prefs)
         for slot in shifts:
-            weights.setdefault((name, slot), FALLBACK_WEIGHT)
+            if slot in pref_set:
+                rank = prefs.index(slot) + 1
+                weights[(name, slot)] = LEX_WEIGHTS.get(rank, 0)
+                A[(name, slot)] = 1
+            else:
+                A[(name, slot)] = 0  # outside availability
 
-    return volunteers, roles, shifts, weights, prefs_map
+    return volunteers, roles, shifts, weights, prefs_map, A
 
 # ----------------------------------
-# Two-phase lexicographic solve
-#   Phase 1: maximize # non-fallback assignments
-#   Phase 2: maximize preference weights subject to Phase 1 optimum
+# Core constraints (availability-only, no fallbacks)
 # ----------------------------------
-def solve_schedule(volunteers, roles, shifts, weights):
-    volunteers = sorted(volunteers)
-    shifts = sorted(shifts)
+def _add_core_constraints(model, x, volunteers, shifts, roles, clean_pairs, A):
+    # ≤ 1 assignment per volunteer (unassigned allowed)
+    for v in volunteers:
+        model.Add(sum(x[(v, s)] for s in shifts) <= 1)
 
+    # Capacity per shift
+    for s in shifts:
+        model.Add(sum(x[(v, s)] for v in volunteers) <= MAX_PER_SHIFT)
+
+    # Forbid assigning outside availability
+    for v in volunteers:
+        for s in shifts:
+            if A[(v, s)] == 0:
+                model.Add(x[(v, s)] == 0)
+
+    # Group pairs together (same shift or both unassigned)
+    for a, b in clean_pairs:
+        for s in shifts:
+            model.Add(x[(a, s)] == x[(b, s)])
+
+    # Mentee→Mentor coverage (MIT doesn't count as mentor)
     mentees = [v for v in volunteers if roles.get(v) == "mentee"]
     mentors = [v for v in volunteers if roles.get(v) == "mentor"]
-    # MIT is NOT counted as mentor for coverage
+    if mentees:
+        z = {s: model.NewBoolVar(f"z_mentor_present_{s}") for s in shifts}
+        for s in shifts:
+            model.Add(sum(x[(v, s)] for v in mentees) <= MAX_PER_SHIFT * z[s])
+            if mentors:
+                model.Add(sum(x[(v, s)] for v in mentors) >= z[s])
+            else:
+                model.Add(z[s] == 0)
+
+# ----------------------------------
+# Tiered "fill" phases then preference tie-break
+#   For l in 1..MAX_PER_SHIFT:
+#     maximize number of shifts with occupancy ≥ l (within availability only).
+#   Then maximize preference weights subject to those locked best-tier counts.
+# ----------------------------------
+def _solve_tier(volunteers, roles, shifts, A, lock_best_by_level: dict[int, int], level_to_optimize: int):
+    model = cp_model.CpModel()
+    x = {(v, s): model.NewBoolVar(f"x_{v}_{s}") for v in volunteers for s in shifts}
 
     clean_pairs = _clean_pairs(volunteers, GROUP_PAIRS)
+    _add_core_constraints(model, x, volunteers, shifts, roles, clean_pairs, A)
 
-    # ----- Phase 1 -----
-    model1 = cp_model.CpModel()
-    x1 = {(v, s): model1.NewBoolVar(f"x1_{v}_{s}") for v in volunteers for s in shifts}
+    # Build tier indicators b_l[s]
+    maxL = MAX_PER_SHIFT
+    b = {l: {s: model.NewBoolVar(f"b{l}_{s}") for s in shifts} for l in range(1, maxL + 1)}
 
-    for v in volunteers:
-        model1.Add(sum(x1[(v, s)] for s in shifts) == 1)
     for s in shifts:
-        model1.Add(sum(x1[(v, s)] for v in volunteers) <= MAX_PER_SHIFT)
-    for a, b in clean_pairs:
-        for s in shifts:
-            model1.Add(x1[(a, s)] == x1[(b, s)])
+        occ = sum(x[(v, s)] for v in volunteers)  # integer sum
+        for l in range(1, maxL + 1):
+            # If b_l[s] = 1 → occ >= l (objective pushes b up)
+            model.Add(occ >= l * b[l][s])
 
-    # Coverage with big-M: if any mentee on s, require a mentor
-    if mentees:
-        z1 = {s: model1.NewBoolVar(f"z1_mentor_present_{s}") for s in shifts}
-        for s in shifts:
-            model1.Add(sum(x1[(v, s)] for v in mentees) <= MAX_PER_SHIFT * z1[s])
-            if mentors:
-                model1.Add(sum(x1[(v, s)] for v in mentors) >= z1[s])
-            else:
-                model1.Add(z1[s] == 0)
+    # Lock previously optimized levels
+    for l, best in lock_best_by_level.items():
+        model.Add(sum(b[l][s] for s in shifts) == best)
 
-    # Objective 1: maximize number of non-fallback assignments
-    model1.Maximize(
-        sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x1[(v, s)]
-            for v in volunteers for s in shifts)
-    )
+    # Optimize current level
+    model.Maximize(sum(b[level_to_optimize][s] for s in shifts))
 
-    solver1 = cp_model.CpSolver()
-    solver1.parameters.random_seed = 42
-    solver1.parameters.num_search_workers = 1
-    solver1.parameters.max_time_in_seconds = 30
-    status1 = solver1.Solve(model1)
-    if status1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("No feasible schedule.")
-    best_nonfb = int(solver1.ObjectiveValue())
+    solver = cp_model.CpSolver()
+    solver.parameters.random_seed = 42
+    solver.parameters.num_search_workers = 1
+    solver.parameters.max_time_in_seconds = 30
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError("No feasible schedule in tiered fill.")
+    best = int(solver.ObjectiveValue())
+    return best
 
-    # ----- Phase 2 -----
-    model2 = cp_model.CpModel()
-    x2 = {(v, s): model2.NewBoolVar(f"x2_{v}_{s}") for v in volunteers for s in shifts}
+def _solve_preferences(volunteers, roles, shifts, A, weights, lock_best_by_level: dict[int, int]):
+    model = cp_model.CpModel()
+    x = {(v, s): model.NewBoolVar(f"x_{v}_{s}") for v in volunteers for s in shifts}
 
-    for v in volunteers:
-        model2.Add(sum(x2[(v, s)] for s in shifts) == 1)
+    clean_pairs = _clean_pairs(volunteers, GROUP_PAIRS)
+    _add_core_constraints(model, x, volunteers, shifts, roles, clean_pairs, A)
+
+    # Rebuild b_l[s] and lock all levels to their best
+    maxL = MAX_PER_SHIFT
+    b = {l: {s: model.NewBoolVar(f"b{l}_{s}") for s in shifts} for l in range(1, maxL + 1)}
     for s in shifts:
-        model2.Add(sum(x2[(v, s)] for v in volunteers) <= MAX_PER_SHIFT)
-    for a, b in clean_pairs:
-        for s in shifts:
-            model2.Add(x2[(a, s)] == x2[(b, s)])
+        occ = sum(x[(v, s)] for v in volunteers)
+        for l in range(1, maxL + 1):
+            model.Add(occ >= l * b[l][s])
+    for l, best in lock_best_by_level.items():
+        model.Add(sum(b[l][s] for s in shifts) == best)
 
-    if mentees:
-        z2 = {s: model2.NewBoolVar(f"z2_mentor_present_{s}") for s in shifts}
-        for s in shifts:
-            model2.Add(sum(x2[(v, s)] for v in mentees) <= MAX_PER_SHIFT * z2[s])
-            if mentors:
-                model2.Add(sum(x2[(v, s)] for v in mentors) >= z2[s])
-            else:
-                model2.Add(z2[s] == 0)
+    # Objective: maximize preference weights (within availability + locked fill)
+    model.Maximize(sum(weights.get((v, s), 0) * x[(v, s)] for v in volunteers for s in shifts))
 
-    # Lock Phase 1 optimum
-    model2.Add(
-        sum((1 if weights[(v, s)] != FALLBACK_WEIGHT else 0) * x2[(v, s)]
-            for v in volunteers for s in shifts) == best_nonfb
-    )
+    solver = cp_model.CpSolver()
+    solver.parameters.random_seed = 42
+    solver.parameters.num_search_workers = 1
+    solver.parameters.max_time_in_seconds = 30
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError("No feasible schedule in preference phase.")
 
-    # Objective 2: maximize preference score (lexicographic second)
-    model2.Maximize(sum(weights[(v, s)] * x2[(v, s)] for v in volunteers for s in shifts))
-
-    solver2 = cp_model.CpSolver()
-    solver2.parameters.random_seed = 42
-    solver2.parameters.num_search_workers = 1
-    solver2.parameters.max_time_in_seconds = 30
-    status2 = solver2.Solve(model2)
-    if status2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("No feasible schedule in phase 2.")
-
-    # Extract schedule (NO extra sort inside each shift)
+    # Extract schedule
     schedule = {s: [] for s in shifts}
     assigned = set()
-    for (v, s), var in x2.items():
-        if solver2.Value(var):
+    for (v, s), var in x.items():
+        if solver.Value(var):
             schedule[s].append({
                 "Name": v,
                 "Role": roles.get(v, "volunteer"),
-                "Fallback": (weights[(v, s)] == FALLBACK_WEIGHT),
+                "Fallback": False,  # availability-only
             })
             assigned.add(v)
     return schedule, assigned
 
+def solve_schedule(volunteers, roles, shifts, weights, A):
+    volunteers = sorted(volunteers)
+    shifts = sorted(shifts)
+
+    # Tiered fill: l = 1..MAX_PER_SHIFT
+    lock_best: dict[int, int] = {}
+    for level in range(1, MAX_PER_SHIFT + 1):
+        best = _solve_tier(volunteers, roles, shifts, A, lock_best, level)
+        lock_best[level] = best
+
+    # Final: preference tie-break under locked best tier counts
+    schedule, assigned = _solve_preferences(volunteers, roles, shifts, A, weights, lock_best)
+    return schedule, assigned
+
 # ----------------------------------
-# Relaxed solve (≤1 per person, keep sensible rules)
+# Relaxed solve (safety net): maximize total assigned within availability
 # ----------------------------------
-def solve_relaxed(volunteers, roles, shifts, weights):
+def solve_relaxed(volunteers, roles, shifts, A, weights):
     volunteers = sorted(volunteers)
     shifts = sorted(shifts)
     model = cp_model.CpModel()
     x = {(v, s): model.NewBoolVar(f"x_{v}_{s}") for v in volunteers for s in shifts}
 
+    # ≤ 1 per person and capacity per shift
     for v in volunteers:
         model.Add(sum(x[(v, s)] for s in shifts) <= 1)
     for s in shifts:
         model.Add(sum(x[(v, s)] for v in volunteers) <= MAX_PER_SHIFT)
 
+    # Availability only
+    for v in volunteers:
+        for s in shifts:
+            if A[(v, s)] == 0:
+                model.Add(x[(v, s)] == 0)
+
+    # Group pairs
     clean_pairs = _clean_pairs(volunteers, GROUP_PAIRS)
     for a, b in clean_pairs:
         for s in shifts:
             model.Add(x[(a, s)] == x[(b, s)])
 
+    # Mentee coverage
     mentees = [v for v in volunteers if roles.get(v) == "mentee"]
     mentors = [v for v in volunteers if roles.get(v) == "mentor"]
-
     if mentees:
         z = {s: model.NewBoolVar(f"z_relax_mentor_present_{s}") for s in shifts}
         for s in shifts:
@@ -433,7 +473,11 @@ def solve_relaxed(volunteers, roles, shifts, weights):
             else:
                 model.Add(z[s] == 0)
 
-    model.Maximize(sum(x[(v, s)] for v in volunteers for s in shifts))
+    # Objective: maximize total assigned; light tie-break by preference
+    model.Maximize(
+        1_000_000 * sum(x[(v, s)] for v in volunteers for s in shifts) +
+        sum(weights.get((v, s), 0) * x[(v, s)] for v in volunteers for s in shifts)
+    )
 
     solver = cp_model.CpSolver()
     solver.parameters.random_seed = 42
@@ -448,7 +492,7 @@ def solve_relaxed(volunteers, roles, shifts, weights):
             schedule[s].append({
                 "Name": v,
                 "Role": roles.get(v, "volunteer"),
-                "Fallback": (weights[(v, s)] == FALLBACK_WEIGHT),
+                "Fallback": False,
             })
             assigned.add(v)
     return schedule, assigned
@@ -461,7 +505,7 @@ def prepare_schedule_df(schedule: dict) -> pd.DataFrame:
     for slot, items in schedule.items():
         for a in items:
             rows.append({
-                "Time Slot": slot,            # already normalized to Day HH:MM-HH:MM (24h)
+                "Time Slot": slot,            # normalized 'Day HH:MM-HH:MM' (24h)
                 "Name": a.get("Name", ""),
                 "Role": a.get("Role", "volunteer"),
                 "Fallback": bool(a.get("Fallback", False)),
@@ -481,9 +525,8 @@ def compute_breakdown(schedule: dict, prefs_map: dict[str, list[str]]) -> pd.Dat
                 idx = prefs.index(slot)
                 if 0 <= idx < len(ord_names):
                     counts[ord_names[idx]] += 1
-                else:
-                    counts["Fallback"] += 1
             else:
+                # Should not happen (availability-only), but keep defensive
                 counts["Fallback"] += 1
     rows = []
     for k in ord_names + ["Fallback"]:
@@ -498,15 +541,16 @@ def compute_breakdown(schedule: dict, prefs_map: dict[str, list[str]]) -> pd.Dat
 def build_schedule(df: pd.DataFrame):
     """
     Returns:
-      sched_df:      [Time Slot, Name, Role, Fallback]  (Time Slot is 24h)
+      sched_df:      [Time Slot, Name, Role, Fallback=False]  (Time Slot is 24h)
       unassigned_df: [Name]
       breakdown_df:  [Preference, Count, Percentage]
     """
-    volunteers, roles, shifts, weights, prefs_map = load_preferences(df)
+    volunteers, roles, shifts, weights, prefs_map, A = load_preferences(df)
     try:
-        schedule, assigned = solve_schedule(volunteers, roles, shifts, weights)
+        schedule, assigned = solve_schedule(volunteers, roles, shifts, weights, A)
     except RuntimeError:
-        schedule, assigned = solve_relaxed(volunteers, roles, shifts, weights)
+        # Safety net if tiered locking ever becomes infeasible
+        schedule, assigned = solve_relaxed(volunteers, roles, shifts, A, weights)
     sched_df = prepare_schedule_df(schedule)
     unassigned = [v for v in volunteers if v not in assigned]
     unassigned_df = pd.DataFrame({"Name": unassigned})
