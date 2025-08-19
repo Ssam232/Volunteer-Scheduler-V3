@@ -13,7 +13,7 @@ for key, default in (
     ("df_raw", None),
     ("sched_df", None),
     ("breakdown_df", None),
-    ("unassigned_df", None),   # NEW: keep unassigned in state
+    ("unassigned_df", None),
     ("group_report", None),
     ("pairs_text", ""),
     ("trigger_run", False),
@@ -53,7 +53,6 @@ def extract_names_for_ui(df: pd.DataFrame) -> list[str]:
     elif "name" in cols:
         s = df[cols["name"]].fillna("").astype(str).str.strip()
     else:
-        # fallback: assume first two columns are first/last
         s = (df.iloc[:, 0].fillna("").astype(str).str.strip() + " " +
              df.iloc[:, 1].fillna("").astype(str).str.strip())
     names = {re.sub(r"\s+", " ", n).strip() for n in s.tolist() if str(n).strip()}
@@ -181,6 +180,50 @@ def explain_non_grouping(a_can: str, b_can: str, sched_df: pd.DataFrame, df_raw:
         return "Shared slots would break mentor coverage (mentee present without a mentor)."
     return "Grouping would worsen the objective under current constraints."
 
+# ---------------- NEW: preference rows helper (dynamic) ----------------------
+def _max_choice_count_from_survey(df_raw: pd.DataFrame) -> int:
+    """
+    Detect the maximum number of ranked choices present in the survey.
+    Falls back to 5 if parsing fails.
+    """
+    try:
+        _, _, _, _, prefs_map = load_preferences(df_raw)
+        mx = max((len(v) for v in prefs_map.values()), default=0)
+        # Your solver only ranks up to 5; cap to 5 to avoid surprises
+        return max(0, min(5, mx))
+    except Exception:
+        return 5
+
+def _rename_and_filter_breakdown(breakdown_df: pd.DataFrame, df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only up to the max choice count present in the survey, and rename
+    rows to '1st choice', '2nd choice', ...
+    Always retain 'Fallback'.
+    """
+    if breakdown_df is None or breakdown_df.empty:
+        return breakdown_df
+
+    max_choices = _max_choice_count_from_survey(df_raw)
+
+    order_src = ["1st","2nd","3rd","4th","5th"]
+    keep_src = order_src[:max_choices] if max_choices > 0 else []
+    keep_src += ["Fallback"]
+
+    df = breakdown_df.copy()
+    df = df[df["Preference"].isin(keep_src)]
+
+    rename_map = {f"{i}st": f"{i}st choice" for i in [1]}
+    rename_map.update({f"{i}nd": f"{i}nd choice" for i in [2]})
+    rename_map.update({f"{i}rd": f"{i}rd choice" for i in [3]})
+    rename_map.update({f"{i}th": f"{i}th choice" for i in [4,5]})
+
+    df["Preference"] = df["Preference"].replace(rename_map)
+    # keep order as displayed
+    pref_order = [rename_map.get(s, s) for s in keep_src]
+    df["__ord"] = df["Preference"].apply(lambda x: pref_order.index(x) if x in pref_order else 999)
+    df = df.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
+    return df
+
 def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     """Run the solver using current pairs_text and store results in session_state."""
     pairs_text = (st.session_state.get("pairs_text") or "").strip()
@@ -200,7 +243,6 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
     # Apply and solve safely
     Scheduler2.GROUP_PAIRS = list(dict.fromkeys(valid_pairs_run))  # dedupe, keep order
     try:
-        # CHANGED: capture unassigned_df as well
         sched_df, unassigned_df, breakdown_df = build_schedule(df_raw)
     except Exception as e:
         st.error(f"Scheduling failed: {e}")
@@ -223,7 +265,7 @@ def run_scheduler(df_raw: pd.DataFrame, vol_lookup: dict):
 
     # Save in session state
     st.session_state.sched_df = sched_df
-    st.session_state.unassigned_df = unassigned_df   # NEW: keep it
+    st.session_state.unassigned_df = unassigned_df
     st.session_state.breakdown_df = breakdown_df
 
     # Group report
@@ -324,7 +366,7 @@ if not uploader:
     st.session_state.df_raw = None
     st.session_state.sched_df = None
     st.session_state.breakdown_df = None
-    st.session_state.unassigned_df = None   # NEW: reset on remove
+    st.session_state.unassigned_df = None
     st.session_state.group_report = None
     st.session_state.pairs_text = ""
     st.session_state.trigger_run = False
@@ -361,7 +403,7 @@ pairs_input = st.text_area(
 ).strip()
 
 # Build suggestions (clickable)
-suggestions: list[tuple[str, str | None]] = []  # (raw_name, suggested or None)
+suggestions: list[tuple[str, str | None]] = []
 if pairs_input:
     for line in pairs_input.splitlines():
         parts = [p.strip() for p in line.split(",") if p.strip()]
@@ -431,11 +473,17 @@ if st.session_state.trigger_run:
 if st.session_state.sched_df is not None:
     sched_df = st.session_state.sched_df.copy()
     breakdown_df = st.session_state.breakdown_df
-    unassigned_df = st.session_state.unassigned_df  # NEW: read from state
-    has_forced = bool(sched_df.get("Fallback", pd.Series([], dtype=bool)).any())
-    has_mit = sched_df.get("Role", pd.Series([], dtype=str)).astype(str).str.lower().eq("mit").any()
+    unassigned_df = st.session_state.unassigned_df
 
-    # Ordered axes for grid/export (use same order everywhere)
+    roles_series = sched_df.get("Role", pd.Series([], dtype=str)).astype(str).str.lower()
+    has_mentor = roles_series.eq("mentor").any()
+    has_mentee = roles_series.eq("mentee").any()
+    has_mit    = roles_series.eq("mit").any()
+    has_vol    = ~roles_series.isin(["mentor","mentee","mit"])
+    has_vol    = bool(has_vol.any())
+    has_forced = bool(sched_df.get("Fallback", pd.Series([], dtype=bool)).any())
+
+    # Ordered axes for grid/export
     days = [d for d in DAY_ORDER if (sched_df["Day"] == d).any()]
     shifts = (
         sched_df[["Shift"]]
@@ -504,22 +552,23 @@ if st.session_state.sched_df is not None:
     )
     st.markdown(html_grid, unsafe_allow_html=True)
 
-    # Legend (conditional MIT/Forced) + Current volunteer
-    legend = (
-        "<div style='margin: 12px 0;'>"
-        "<span style='display:inline-block;margin-right:16px;'><strong>Mentor</strong></span>"
-        "<span style='display:inline-block;margin-right:16px;background:#ADD8E6;"
-        "padding:2px 6px;border-radius:4px;'>Mentee</span>"
-    )
+    # ── Dynamic Legend (only show items that actually appear) ────────────────
+    legend_parts = []
+    if has_mentor:
+        legend_parts.append("<span style='display:inline-block;margin-right:16px;'><strong>Mentor</strong></span>")
+    if has_mentee:
+        legend_parts.append("<span style='display:inline-block;margin-right:16px;background:#ADD8E6; padding:2px 6px;border-radius:4px;'>Mentee</span>")
     if has_mit:
-        legend += "<span style='display:inline-block;margin-right:16px;'><em>Mentor in training</em></span>"
+        legend_parts.append("<span style='display:inline-block;margin-right:16px;'><em>Mentor in training</em></span>")
     if has_forced:
-        legend += "<span style='display:inline-block;margin-right:16px;'>* Forced</span>"
-    legend += "<span style='display:inline-block;margin-right:16px;'>Current volunteer</span>"
-    legend += "</div>"
-    st.markdown(legend, unsafe_allow_html=True)
+        legend_parts.append("<span style='display:inline-block;margin-right:16px;'>* Forced</span>")
+    if has_vol:
+        legend_parts.append("<span style='display:inline-block;margin-right:16px;'>Current volunteer</span>")
 
-    # ── NEW: Coverage Summary (above Preference Breakdown) ────────────────────
+    if legend_parts:
+        st.markdown("<div style='margin:12px 0;'>" + "".join(legend_parts) + "</div>", unsafe_allow_html=True)
+
+    # ── Coverage Summary (above Preference Breakdown) ────────────────────────
     total_cells = len(days) * len(shifts)
     non_empty = sum(1 for sh in shifts for d in days if len(grid.get(sh, {}).get(d, [])) > 0)
     empty_cells = total_cells - non_empty
@@ -531,22 +580,23 @@ if st.session_state.sched_df is not None:
         {"Metric": "Total shifts", "Value": total_cells},
         {"Metric": "Occupied shifts", "Value": non_empty},
         {"Metric": "Empty shifts", "Value": empty_cells},
-        {"Metric": f"Fully filled shifts (Volunteers ={MAX_PER_SHIFT})", "Value": full_cells},
+        {"Metric": f"Fully filled shifts (Volunteers = {MAX_PER_SHIFT})", "Value": full_cells},
         {"Metric": "Average volunteers per shift", "Value": f"{avg_occ:.0f}"},
     ]
     st.subheader("Shift Coverage Summary")
     st.dataframe(pd.DataFrame(coverage_rows), use_container_width=True)
 
-    # Preference Breakdown
+    # ── Preference Breakdown (trimmed to max choices; renamed) ───────────────
+    trimmed_breakdown = _rename_and_filter_breakdown(breakdown_df, df_raw)
     st.subheader("Preference Breakdown")
-    st.dataframe(breakdown_df, use_container_width=True)
+    st.dataframe(trimmed_breakdown, use_container_width=True)
 
-    # ── NEW: Unassigned (only if non-empty) ───────────────────────────────────
+    # ── Unassigned (only if non-empty) ───────────────────────────────────────
     if isinstance(unassigned_df, pd.DataFrame) and not unassigned_df.empty:
         st.subheader("Unassigned Volunteers")
         st.dataframe(unassigned_df, use_container_width=True)
 
-    # Forced Assignments
+    # ── Forced Assignments list ──────────────────────────────────────────────
     st.subheader("Forced Assignments")
     fb = sched_df[sched_df.get("Fallback", False) == True] if "Fallback" in sched_df.columns else pd.DataFrame()
     if not fb.empty:
@@ -555,7 +605,7 @@ if st.session_state.sched_df is not None:
     else:
         st.write("_None_")
 
-    # ── Excel export (defensive: format if xlsxwriter, fallback otherwise) ────
+    # ── Excel export (formatted if xlsxwriter) ───────────────────────────────
     def to_excel_bytes():
         buf = io.BytesIO()
         try:
@@ -564,19 +614,24 @@ if st.session_state.sched_df is not None:
         except Exception:
             engine = "openpyxl"
 
+        # local copies for export
+        days_local = days[:]
+        shifts_local = shifts[:]
+        has_mentor_l = has_mentor
+        has_mentee_l = has_mentee
+        has_mit_l    = has_mit
+        has_forced_l = has_forced
+        has_vol_l    = has_vol
+        trimmed_pref = _rename_and_filter_breakdown(breakdown_df, df_raw)
+
         if engine == "xlsxwriter":
             with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
                 wb = writer.book
-                # Formats
                 border     = wb.add_format({"border": 1})
                 mentor_fmt = wb.add_format({"border": 1, "bold": True})
                 mentee_fmt = wb.add_format({"border": 1, "bg_color": "#ADD8E6"})
                 mit_fmt    = wb.add_format({"border": 1, "italic": True})
                 vol_fmt    = wb.add_format({"border": 1})
-
-                # Use the same ordered axes as the preview
-                days_local = days[:]
-                shifts_local = shifts[:]
 
                 # Build grid dict safely for export
                 grid_x = {sh: {d: [] for d in days_local} for sh in shifts_local}
@@ -611,20 +666,24 @@ if st.session_state.sched_df is not None:
                 ws.set_column(0, 0, 16)
                 ws.set_column(1, len(days_local), 22)
 
-                # Legend row
-                row_idx += 1
-                ws.write(row_idx, 0, "Legend:", border)
-                col = 1
-                ws.write(row_idx, col, "Mentor", mentor_fmt); col += 1
-                ws.write(row_idx, col, "Mentee", mentee_fmt); col += 1
-                if has_mit:
-                    ws.write(row_idx, col, "Mentor in training", mit_fmt); col += 1
-                if has_forced:
-                    ws.write(row_idx, col, "* Forced", border); col += 1
-                ws.write(row_idx, col, "Current volunteer", border)
+                # Legend row (dynamic)
+                legend_cols = []
+                if has_mentor_l: legend_cols.append(("Mentor", mentor_fmt))
+                if has_mentee_l: legend_cols.append(("Mentee", mentee_fmt))
+                if has_mit_l:    legend_cols.append(("Mentor in training", mit_fmt))
+                if has_forced_l: legend_cols.append(("* Forced", border))
+                if has_vol_l:    legend_cols.append(("Current volunteer", border))
 
-                # Preferences & Fallback sheets
-                breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
+                if legend_cols:
+                    row_idx += 1
+                    ws.write(row_idx, 0, "Legend:", border)
+                    c = 1
+                    for label, fmt in legend_cols:
+                        ws.write(row_idx, c, label, fmt)
+                        c += 1
+
+                # Preferences (trimmed) & Fallback sheets
+                trimmed_pref.to_excel(writer, sheet_name="Preferences", index=False)
                 fb_df = sched_df[sched_df.get("Fallback", False) == True][["Time Slot","Name","Role"]] \
                         if "Fallback" in sched_df.columns else pd.DataFrame(columns=["Time Slot","Name","Role"])
                 fb_df.to_excel(writer, sheet_name="Fallback", index=False)
@@ -634,11 +693,10 @@ if st.session_state.sched_df is not None:
                     unassigned_df.to_excel(writer, sheet_name="Unassigned", index=False)
 
         else:
-            # Fallback: minimal export without formatting
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                 sched_cols = [c for c in ["Time Slot","Day","Shift","Name","Role","Fallback"] if c in sched_df.columns]
                 sched_df[sched_cols].to_excel(writer, sheet_name="Schedule", index=False)
-                breakdown_df.to_excel(writer, sheet_name="Preferences", index=False)
+                _rename_and_filter_breakdown(breakdown_df, df_raw).to_excel(writer, sheet_name="Preferences", index=False)
                 fb_df = sched_df[sched_df.get("Fallback", False) == True][["Time Slot","Name","Role"]] \
                         if "Fallback" in sched_df.columns else pd.DataFrame(columns=["Time Slot","Name","Role"])
                 fb_df.to_excel(writer, sheet_name="Fallback", index=False)
